@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,10 @@ class FoundationTests(unittest.TestCase):
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
         (directory / "skills").mkdir()
+        scripts = directory / "scripts"
+        scripts.mkdir()
+        for runtime_name in ("team-skills.sh", "team-skills-json.awk", "team-skills.ps1"):
+            shutil.copy2(ROOT / "scripts" / runtime_name, scripts / runtime_name)
 
     def run_creator(self, root: Path, name: str = "release-notes") -> subprocess.CompletedProcess[str]:
         body = root / "body.md"

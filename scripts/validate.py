@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ CATALOG_KEYS = {
     "skills_directory",
     "default_prefix",
 }
+RUNTIME_FILES = ("team-skills.sh", "team-skills-json.awk", "team-skills.ps1")
 
 
 @dataclass(frozen=True)
@@ -140,6 +142,18 @@ def validate_catalog(root: Path) -> tuple[list[str], int, str]:
         return [f"{manifest_path}: cannot read valid UTF-8 JSON: {exc}"], 0, "unknown"
     if not isinstance(manifest, dict):
         return [f"{manifest_path}: top level must be an object"], 0, "unknown"
+
+    scripts_root = root / "scripts"
+    if scripts_root.is_symlink() or not scripts_root.is_dir():
+        errors.append(f"{scripts_root}: must be a regular directory")
+    else:
+        for runtime_name in RUNTIME_FILES:
+            runtime_path = scripts_root / runtime_name
+            if runtime_path.is_symlink() or not runtime_path.is_file():
+                errors.append(f"{runtime_path}: required lifecycle runtime must be a regular file")
+        shell_runtime = scripts_root / "team-skills.sh"
+        if shell_runtime.is_file() and not shell_runtime.is_symlink() and not os.access(shell_runtime, os.X_OK):
+            errors.append(f"{shell_runtime}: POSIX lifecycle runtime must be executable")
 
     unknown = set(manifest) - CATALOG_KEYS
     missing = CATALOG_KEYS - set(manifest)

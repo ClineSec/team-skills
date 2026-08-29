@@ -77,6 +77,8 @@ class PowerShellInstallerTests(unittest.TestCase):
         runtime = work / "scripts"
         runtime.mkdir()
         shutil.copy2(INSTALLER, runtime / "team-skills.ps1")
+        shutil.copy2(ROOT / "scripts" / "team-skills.sh", runtime / "team-skills.sh")
+        shutil.copy2(ROOT / "scripts" / "team-skills-json.awk", runtime / "team-skills-json.awk")
         self.git("init", "--initial-branch=main", str(work))
         self.git("config", "user.name", "Installer Test", cwd=work)
         self.git("config", "user.email", "installer@example.invalid", cwd=work)
@@ -420,7 +422,7 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertNotIn("fixture-password", combined)
         self.assertIn("unable to clone the supplied repository", combined)
 
-    def test_configured_origin_can_change_without_changing_instance_ownership(self) -> None:
+    def test_non_fast_forward_origin_change_is_rejected_with_remove_reinstall_recovery(self) -> None:
         _, initial_origin = self.make_catalog("initial", "# Initial origin")
         _, replacement_origin = self.make_catalog("replacement", "# Replacement origin")
         installed = self.run_installer("install", initial_origin)
@@ -432,15 +434,35 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.git("remote", "set-url", "origin", str(replacement_origin), cwd=managed_repo)
 
         reconciled = self.run_installer("install", initial_origin)
-        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
-        self.assertIn(
-            "# Replacement origin", (self.agents / "common-skill" / "SKILL.md").read_text()
-        )
+        self.assertNotEqual(reconciled.returncode, 0)
+        self.assertIn("history is not a fast-forward", reconciled.stderr)
+        self.assertIn("# Initial origin", (self.agents / "common-skill" / "SKILL.md").read_text())
         self.assertEqual(list((self.state / "catalogs").iterdir()), instance_roots)
 
         removed = self.run_installer("remove", initial_origin)
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertFalse(self.agents.joinpath("common-skill").exists())
+        reinstalled = self.run_installer("install", replacement_origin)
+        self.assertEqual(reinstalled.returncode, 0, reinstalled.stderr)
+        self.assertIn("# Replacement origin", (self.agents / "common-skill" / "SKILL.md").read_text())
+
+    def test_invalid_fetched_lifecycle_runtime_cannot_advance_managed_clone(self) -> None:
+        work, origin = self.make_catalog("runtime", "# Known good runtime")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = next((self.state / "catalogs").iterdir())
+        managed = instance / "repo"
+        previous = self.git("rev-parse", "HEAD", cwd=managed).stdout.strip()
+        runtime = work / "scripts" / "team-skills.ps1"
+        runtime.write_text("param([string]$Broken\r\n", encoding="utf-8")
+        self.git("add", ".", cwd=work)
+        self.git("commit", "-m", "malformed lifecycle candidate", cwd=work)
+        self.git("push", cwd=work)
+
+        failed = self.run_installer("install", origin)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("fetched catalog is invalid", failed.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=managed).stdout.strip(), previous)
+        self.assertIn("# Known good runtime", (self.agents / "common-skill" / "SKILL.md").read_text())
 
     def test_late_exposure_race_rolls_back_generation_and_ownership(self) -> None:
         work, origin = self.make_catalog("race", "# Known good")
@@ -522,22 +544,28 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertFalse((self.agents / "common-skill").exists())
         self.assertFalse((self.claude / "zz-race-skill").exists())
 
-    def test_url_free_update_reconciles_all_prefixes_from_changed_origin(self) -> None:
+    def test_url_free_update_reconciles_all_prefixes_at_one_candidate(self) -> None:
         work, initial_origin = self.make_catalog("all-prefixes", "# Initial")
-        _, replacement_origin = self.make_catalog("replacement", "# Replacement")
         self.assertEqual(self.run_installer("install", initial_origin).returncode, 0)
         self.assertEqual(
             self.run_installer("install", initial_origin, "-Prefix", "fork").returncode, 0
         )
 
         instance = next((self.state / "catalogs").iterdir())
-        self.git("remote", "set-url", "origin", str(replacement_origin), cwd=instance / "repo")
+        skill_file = work / "skills" / "common-skill" / "SKILL.md"
+        skill_file.write_text(
+            skill_file.read_text(encoding="utf-8").replace("# Initial", "# Updated"),
+            encoding="utf-8",
+        )
+        self.git("add", ".", cwd=work)
+        self.git("commit", "-m", "update every prefix", cwd=work)
+        self.git("push", cwd=work)
         self.env.update({"TEAM_SKILLS_NOW": "2000000000", "TEAM_SKILLS_THROTTLE_SECONDS": "0"})
         updated = self.run_updater()
         self.assertEqual(updated.returncode, 0, updated.stderr)
-        self.assertIn("# Replacement", (self.agents / "common-skill" / "SKILL.md").read_text())
+        self.assertIn("# Updated", (self.agents / "common-skill" / "SKILL.md").read_text())
         self.assertIn(
-            "# Replacement", (self.claude / "fork-common-skill" / "SKILL.md").read_text()
+            "# Updated", (self.claude / "fork-common-skill" / "SKILL.md").read_text()
         )
         self.assertEqual((instance / "last-success").read_text().strip(), "2000000000")
 

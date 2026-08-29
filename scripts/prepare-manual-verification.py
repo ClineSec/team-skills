@@ -109,11 +109,8 @@ def write_catalog(root: Path, label: str, marker: str, env: dict[str, str]) -> t
     )
     runtime = work / "scripts"
     runtime.mkdir()
-    if os.name == "nt":
-        shutil.copy2(REPOSITORY_ROOT / "scripts" / "team-skills.ps1", runtime)
-    else:
-        shutil.copy2(REPOSITORY_ROOT / "scripts" / "team-skills.sh", runtime)
-        shutil.copy2(REPOSITORY_ROOT / "scripts" / "team-skills-json.awk", runtime)
+    for runtime_name in ("team-skills.sh", "team-skills-json.awk", "team-skills.ps1"):
+        shutil.copy2(REPOSITORY_ROOT / "scripts" / runtime_name, runtime)
     git(env, "init", "--initial-branch=main", str(work))
     git(env, "config", "user.name", "Team Skills Manual Fixture", cwd=work)
     git(env, "config", "user.email", "fixture@example.invalid", cwd=work)

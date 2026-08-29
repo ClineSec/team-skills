@@ -82,13 +82,8 @@ class IntegratedMvpProof(unittest.TestCase):
         )
         runtime = work / "scripts"
         runtime.mkdir()
-        if os.name == "nt":
-            shutil.copy2(ROOT / "scripts" / "team-skills.ps1", runtime / "team-skills.ps1")
-        else:
-            shutil.copy2(ROOT / "scripts" / "team-skills.sh", runtime / "team-skills.sh")
-            shutil.copy2(
-                ROOT / "scripts" / "team-skills-json.awk", runtime / "team-skills-json.awk"
-            )
+        for runtime_name in ("team-skills.sh", "team-skills-json.awk", "team-skills.ps1"):
+            shutil.copy2(ROOT / "scripts" / runtime_name, runtime / runtime_name)
         self.git("init", "--initial-branch=main", str(work))
         self.git("config", "user.name", "Integrated MVP Test", cwd=work)
         self.git("config", "user.email", "mvp@example.invalid", cwd=work)

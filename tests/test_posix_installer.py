@@ -73,6 +73,7 @@ class PosixInstallerTests(unittest.TestCase):
         runtime.mkdir()
         shutil.copy2(INSTALLER, runtime / "team-skills.sh")
         shutil.copy2(ROOT / "scripts" / "team-skills-json.awk", runtime / "team-skills-json.awk")
+        shutil.copy2(ROOT / "scripts" / "team-skills.ps1", runtime / "team-skills.ps1")
         if executable_resource:
             helper.chmod(helper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         self.git("init", "--initial-branch=main", str(work))
@@ -436,7 +437,7 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertIn("keeping the last known-good installation", failed.stderr)
         self.assertEqual(exposed.read_bytes(), original)
 
-    def test_configured_origin_can_change_without_changing_instance_ownership(self) -> None:
+    def test_non_fast_forward_origin_change_is_rejected_with_remove_reinstall_recovery(self) -> None:
         _, initial_origin = self.make_catalog("initial", "# Initial origin")
         _, replacement_origin = self.make_catalog("replacement", "# Replacement origin")
         installed = self.run_installer("install", initial_origin)
@@ -448,15 +449,35 @@ class PosixInstallerTests(unittest.TestCase):
         self.git("remote", "set-url", "origin", str(replacement_origin), cwd=managed_repo)
 
         reconciled = self.run_installer("install", initial_origin)
-        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
-        self.assertIn(
-            "# Replacement origin", (self.agents / "common-skill" / "SKILL.md").read_text()
-        )
+        self.assertNotEqual(reconciled.returncode, 0)
+        self.assertIn("history is not a fast-forward", reconciled.stderr)
+        self.assertIn("# Initial origin", (self.agents / "common-skill" / "SKILL.md").read_text())
         self.assertEqual(list((self.state / "catalogs").iterdir()), instance_roots)
 
         removed = self.run_installer("remove", initial_origin)
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertFalse(self.agents.joinpath("common-skill").exists())
+        reinstalled = self.run_installer("install", replacement_origin)
+        self.assertEqual(reinstalled.returncode, 0, reinstalled.stderr)
+        self.assertIn("# Replacement origin", (self.agents / "common-skill" / "SKILL.md").read_text())
+
+    def test_invalid_fetched_lifecycle_runtime_cannot_advance_managed_clone(self) -> None:
+        work, origin = self.make_catalog("runtime", "# Known good runtime")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        managed = self.instance_root() / "repo"
+        previous = self.git("rev-parse", "HEAD", cwd=managed).stdout.strip()
+        runtime = work / "scripts" / "team-skills.sh"
+        runtime.write_text("#!/bin/sh\nif then malformed\n", encoding="utf-8")
+        runtime.chmod(0o755)
+        self.git("add", ".", cwd=work)
+        self.git("commit", "-m", "malformed lifecycle candidate", cwd=work)
+        self.git("push", cwd=work)
+
+        failed = self.run_installer("install", origin)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("fetched catalog is invalid", failed.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=managed).stdout.strip(), previous)
+        self.assertIn("# Known good runtime", (self.agents / "common-skill" / "SKILL.md").read_text())
 
     def test_failed_current_replacement_retains_last_known_good_view(self) -> None:
         work, origin = self.make_catalog("replacement", "# Known good")
@@ -660,6 +681,60 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertIn("must be an absolute path", result.stderr)
         self.assertFalse((self.base / "relative").exists())
 
+    def test_root_traversal_and_symlink_components_fail_before_clone(self) -> None:
+        for unsafe in ("////", str(self.base / "safe" / ".." / "escape")):
+            with self.subTest(unsafe=unsafe):
+                self.env["TEAM_SKILLS_STATE_ROOT"] = unsafe
+                result = self.run_installer("install", "/not/used")
+                self.assertNotEqual(result.returncode, 0)
+        real = self.base / "real state"
+        real.mkdir()
+        linked = self.base / "linked state"
+        linked.symlink_to(real, target_is_directory=True)
+        self.env["TEAM_SKILLS_STATE_ROOT"] = str(linked)
+        result = self.run_installer("install", "/not/used")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not be a symlink", result.stderr)
+
+    def test_late_remove_failure_restores_committed_hook_edits(self) -> None:
+        _, origin = self.make_catalog("remove-rollback", "# Remove rollback")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        hook_paths = (
+            self.home / ".claude" / "settings.json",
+            self.home / ".codex" / "hooks.json",
+            self.home / ".cursor" / "hooks.json",
+        )
+        installed_hooks = {path: path.read_bytes() for path in hook_paths}
+        command_bin = self.base / "remove failure bin"
+        command_bin.mkdir()
+        real_rm = shutil.which("rm")
+        self.assertIsNotNone(real_rm)
+        wrapper = command_bin / "rm"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "for argument do\n"
+            "  case $argument in */.agents/skills/common-skill) exit 73 ;; esac\n"
+            "done\n"
+            'exec "$TEAM_SKILLS_TEST_REAL_RM" "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        original_path = self.env["PATH"]
+        self.env.update({
+            "PATH": str(command_bin) + os.pathsep + original_path,
+            "TEAM_SKILLS_TEST_REAL_RM": real_rm or "",
+        })
+        failed = self.run_installer("remove", origin)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("cannot remove owned exposure", failed.stderr)
+        for path in hook_paths:
+            self.assertEqual(path.read_bytes(), installed_hooks[path])
+        self.assertTrue(self.instance_root().is_dir())
+
+        self.env["PATH"] = original_path
+        removed = self.run_installer("remove", origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+
     def test_url_free_update_reconciles_every_installed_prefix(self) -> None:
         work, origin = self.make_catalog("all-prefixes", "# Initial")
         first = self.run_installer("install", origin)
@@ -684,6 +759,52 @@ class PosixInstallerTests(unittest.TestCase):
             "# Updated", (self.claude / "fork-common-skill" / "SKILL.md").read_text()
         )
         self.assertEqual((self.instance_root() / "last-success").read_text().strip(), "2000000000")
+
+    def test_multi_prefix_update_fetches_once_and_pins_one_candidate(self) -> None:
+        work, origin = self.make_catalog("pinned-prefixes", "# Initial")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        self.assertEqual(
+            self.run_installer("install", origin, "--prefix", "fork").returncode, 0
+        )
+        skill_file = work / "skills" / "common-skill" / "SKILL.md"
+        skill_file.write_text(
+            skill_file.read_text(encoding="utf-8").replace("# Initial", "# One candidate"),
+            encoding="utf-8",
+        )
+        self.git("add", ".", cwd=work)
+        self.git("commit", "-m", "one pinned candidate", cwd=work)
+        self.git("push", cwd=work)
+
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        command_bin = self.base / "single fetch command bin"
+        command_bin.mkdir()
+        wrapper = command_bin / "git"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = -C ] && [ \"$3\" = fetch ]; then\n"
+            "  printf '%s\\n' fetch >>\"$TEAM_SKILLS_TEST_FETCH_LOG\"\n"
+            "fi\n"
+            'exec "$TEAM_SKILLS_TEST_REAL_GIT" "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        fetch_log = self.base / "multi-prefix fetch calls.log"
+        self.env.update(
+            {
+                "PATH": str(command_bin) + os.pathsep + self.env["PATH"],
+                "TEAM_SKILLS_TEST_REAL_GIT": real_git or "",
+                "TEAM_SKILLS_TEST_FETCH_LOG": str(fetch_log),
+                "TEAM_SKILLS_THROTTLE_SECONDS": "0",
+            }
+        )
+        updated = self.run_updater()
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertEqual(fetch_log.read_text(encoding="utf-8").splitlines(), ["fetch"])
+        self.assertIn("# One candidate", (self.agents / "common-skill" / "SKILL.md").read_text())
+        self.assertIn(
+            "# One candidate", (self.claude / "fork-common-skill" / "SKILL.md").read_text()
+        )
 
     def test_throttled_update_and_active_lock_do_not_fetch(self) -> None:
         _, origin = self.make_catalog("throttle", "# Initial")
@@ -912,7 +1033,7 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertNotIn("fixture-password", log)
         self.assertEqual((self.agents / "common-skill" / "SKILL.md").read_bytes(), original)
 
-    def test_changed_configured_origin_updates_without_bootstrap_url(self) -> None:
+    def test_changed_configured_origin_update_fails_closed_without_bootstrap_url(self) -> None:
         _, initial_origin = self.make_catalog("url-free-initial", "# Initial")
         _, replacement_origin = self.make_catalog("url-free-replacement", "# Replacement")
         installed = self.run_installer("install", initial_origin)
@@ -922,10 +1043,9 @@ class PosixInstallerTests(unittest.TestCase):
         self.env["TEAM_SKILLS_THROTTLE_SECONDS"] = "0"
 
         updated = self.run_updater()
-        self.assertEqual(updated.returncode, 0, updated.stderr)
-        self.assertIn(
-            "# Replacement", (self.agents / "common-skill" / "SKILL.md").read_text()
-        )
+        self.assertNotEqual(updated.returncode, 0)
+        self.assertIn("history is not a fast-forward", updated.stderr)
+        self.assertIn("# Initial", (self.agents / "common-skill" / "SKILL.md").read_text())
 
 
 if __name__ == "__main__":

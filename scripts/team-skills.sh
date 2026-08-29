@@ -10,6 +10,7 @@ PREFIX=
 REPOSITORY_URL=
 INSTANCE_ARGUMENT=
 INSTALL_KEY_ARGUMENT=
+CANDIDATE_ARGUMENT=
 
 die() {
     printf '%s\n' "error: $*" >&2
@@ -54,10 +55,11 @@ case $ACTION in
         shift 2
         ;;
     update-prefix)
-        [ "$#" -eq 3 ] || usage
+        { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || usage
         INSTANCE_ARGUMENT=$2
         INSTALL_KEY_ARGUMENT=$3
-        shift 3
+        if [ "$#" -eq 4 ]; then CANDIDATE_ARGUMENT=$4; fi
+        shift "$#"
         ;;
     *) usage ;;
 esac
@@ -96,7 +98,18 @@ reject_unsafe_root() {
         /*) ;;
         *) die "$root_label must be an absolute path" ;;
     esac
-    [ "$root_value" != / ] || die "$root_label must not be the filesystem root"
+    case $root_value in
+        *[!/]*) ;;
+        *) die "$root_label must not be the filesystem root" ;;
+    esac
+    case $root_value in
+        *//*|*/./*|*/.|*/../*|*/..) die "$root_label must be normalized without empty, . or .. path components" ;;
+    esac
+
+    # Refuse an existing override target that is itself a symlink. Existing system ancestors can
+    # legitimately be links (for example /var on macOS), so later owned-path checks remain the
+    # boundary for descendants.
+    [ ! -L "$root_value" ] || die "$root_label must not be a symlink"
 }
 
 reject_unsafe_root "$STATE_ROOT" TEAM_SKILLS_STATE_ROOT
@@ -266,6 +279,7 @@ finalize_hook_ownership() {
     [ "${HOOK_CHANGES_PREPARED:-0}" -eq 1 ] || return 0
     if [ "$ACTION" = remove ]; then
         rm -rf "$HOOK_OWNERSHIP_ROOT"
+        HOOK_CHANGES_COMMITTED=0
         return 0
     fi
     if [ -e "$HOOK_OWNERSHIP_ROOT" ] || [ -L "$HOOK_OWNERSHIP_ROOT" ]; then
@@ -280,6 +294,7 @@ finalize_hook_ownership() {
         printf '%s\n%s\n' "$hook_config" "$HOOK_COMMAND" >"$hook_owner_temp" && \
             mv "$hook_owner_temp" "$hook_owner" || die "cannot record $hook_product hook ownership"
     done
+    HOOK_CHANGES_COMMITTED=0
 }
 
 valid_instance_key() {
@@ -370,6 +385,25 @@ run_catalog_update() {
     update_failed=0
     installs_root=$update_root/installs
     [ -d "$installs_root" ] && [ ! -L "$installs_root" ] || update_failed=1
+    update_candidate=
+    if [ "$update_failed" -eq 0 ]; then
+        update_repo=$update_root/repo
+        update_previous=$(git -C "$update_repo" rev-parse HEAD 2>/dev/null) || update_failed=1
+        if [ "$update_failed" -eq 0 ] && ! GIT_TERMINAL_PROMPT=0 git -C "$update_repo" fetch --quiet origin >/dev/null 2>&1; then
+            printf '%s\n' "error: unable to fetch the managed catalog origin" >&2
+            update_failed=1
+        fi
+        if [ "$update_failed" -eq 0 ]; then
+            update_remote_head=$(git -C "$update_repo" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || update_failed=1
+        fi
+        if [ "$update_failed" -eq 0 ]; then
+            update_candidate=$(git -C "$update_repo" rev-parse "$update_remote_head^{commit}" 2>/dev/null) || update_failed=1
+        fi
+        if [ "$update_failed" -eq 0 ] && ! git -C "$update_repo" merge-base --is-ancestor "$update_previous" "$update_candidate" >/dev/null 2>&1; then
+            printf '%s\n' "error: fetched catalog history is not a fast-forward; keeping the last known-good installation" >&2
+            update_failed=1
+        fi
+    fi
     if [ "$update_failed" -eq 0 ]; then
         found_install=0
         for installed_view in "$installs_root"/*; do
@@ -383,7 +417,7 @@ run_catalog_update() {
                 fi
             fi
             found_install=1
-            if ! GIT_TERMINAL_PROMPT=0 sh "$SCRIPT_PATH" update-prefix "$update_key" "$installed_key"; then
+            if ! GIT_TERMINAL_PROMPT=0 sh "$SCRIPT_PATH" update-prefix "$update_key" "$installed_key" "$update_candidate"; then
                 update_failed=1
             fi
         done
@@ -487,11 +521,12 @@ replace_link() {
 }
 
 rollback_transaction() {
+    # Hook edits can commit before an uninstall touches exposures. Always roll them back on a
+    # later failure, even though removal does not activate an installation transaction.
+    rollback_hook_changes || printf '%s\n' "warning: installation rollback could not fully restore catalog-owned hook configuration" >&2
     [ "${TRANSACTION_ACTIVE:-0}" -eq 1 ] || return 0
     TRANSACTION_ACTIVE=0
     rollback_failed=0
-
-    rollback_hook_changes || rollback_failed=1
 
     # Remove newly created links while their candidate targets still exist. This keeps
     # ownership proof inspectable for Windows junctions as well as POSIX symlinks.
@@ -597,8 +632,21 @@ validate_skill() {
     [ "$declared_name" = "$expected_name" ] || return 1
 }
 
+validate_runtime() {
+    runtime_root=$1/scripts
+    [ -d "$runtime_root" ] && [ ! -L "$runtime_root" ] || return 1
+    [ -f "$runtime_root/team-skills.sh" ] && [ ! -L "$runtime_root/team-skills.sh" ] && \
+        [ -r "$runtime_root/team-skills.sh" ] && [ -x "$runtime_root/team-skills.sh" ] || return 1
+    [ -f "$runtime_root/team-skills-json.awk" ] && [ ! -L "$runtime_root/team-skills-json.awk" ] && \
+        [ -r "$runtime_root/team-skills-json.awk" ] || return 1
+    [ -f "$runtime_root/team-skills.ps1" ] && [ ! -L "$runtime_root/team-skills.ps1" ] && \
+        [ -r "$runtime_root/team-skills.ps1" ] || return 1
+    sh -n "$runtime_root/team-skills.sh" >/dev/null 2>&1 || return 1
+}
+
 validate_catalog() {
     catalog_root=$1
+    validate_runtime "$catalog_root" || return 1
     manifest=$catalog_root/catalog.json
     [ -f "$manifest" ] && [ ! -L "$manifest" ] || return 1
     keys=$WORK_ROOT/manifest-keys
@@ -749,6 +797,7 @@ if [ "$ACTION" = remove ]; then
     done
     rm -rf "$INSTALL_ROOT"
     if [ -d "$INSTANCE_ROOT/installs" ] && [ -z "$(find "$INSTANCE_ROOT/installs" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+        [ "$remaining_install" -ne 0 ] || finalize_hook_ownership
         rm -rf "$INSTANCE_ROOT"
         if [ -f "$ORIGIN_INDEX" ] && [ "$(sed -n '1p' "$ORIGIN_INDEX")" = "$INSTANCE_KEY" ]; then
             rm "$ORIGIN_INDEX"
@@ -771,12 +820,24 @@ if [ "$EXISTING_INSTANCE" -eq 0 ]; then
 else
     # All later network behavior names the managed clone's configured origin, never a baked URL.
     PREVIOUS_REPO_HEAD=$(git -C "$MANAGED_REPO" rev-parse HEAD 2>/dev/null) || die "managed catalog clone has no Git revision"
-    if ! git -C "$MANAGED_REPO" fetch --quiet origin >"$WORK_ROOT/fetch.log" 2>&1; then
-        die "unable to fetch the managed catalog origin"
+    if [ -n "$CANDIDATE_ARGUMENT" ]; then
+        case $CANDIDATE_ARGUMENT in *[!0-9a-f]*) die "pinned catalog candidate is invalid" ;; esac
+        { [ ${#CANDIDATE_ARGUMENT} -eq 40 ] || [ ${#CANDIDATE_ARGUMENT} -eq 64 ]; } || die "pinned catalog candidate is invalid"
+        REMOTE_HEAD=$(git -C "$MANAGED_REPO" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || die "managed origin has no default branch"
+        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse "$REMOTE_HEAD^{commit}" 2>/dev/null) || die "managed origin default branch has no commit"
+        [ "$CANDIDATE_REVISION" = "$CANDIDATE_ARGUMENT" ] || die "managed origin candidate changed during catalog update"
+    else
+        if ! git -C "$MANAGED_REPO" fetch --quiet origin >"$WORK_ROOT/fetch.log" 2>&1; then
+            die "unable to fetch the managed catalog origin"
+        fi
+        REMOTE_HEAD=$(git -C "$MANAGED_REPO" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || die "managed origin has no default branch"
+        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse "$REMOTE_HEAD^{commit}" 2>/dev/null) || die "managed origin default branch has no commit"
     fi
-    REMOTE_HEAD=$(git -C "$MANAGED_REPO" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || die "managed origin has no default branch"
+    if ! git -C "$MANAGED_REPO" merge-base --is-ancestor "$PREVIOUS_REPO_HEAD" "$CANDIDATE_REVISION" >/dev/null 2>&1; then
+        die "fetched catalog history is not a fast-forward; keeping the last known-good installation"
+    fi
     CANDIDATE_WORKTREE=$WORK_ROOT/candidate
-    if ! git -C "$MANAGED_REPO" worktree add --quiet --detach "$CANDIDATE_WORKTREE" "$REMOTE_HEAD" >"$WORK_ROOT/worktree.log" 2>&1; then
+    if ! git -C "$MANAGED_REPO" worktree add --quiet --detach "$CANDIDATE_WORKTREE" "$CANDIDATE_REVISION" >"$WORK_ROOT/worktree.log" 2>&1; then
         die "unable to stage the fetched catalog"
     fi
     SOURCE_ROOT=$CANDIDATE_WORKTREE
@@ -922,7 +983,7 @@ for product in agents claude; do
 done
 
 if [ -n "${CANDIDATE_WORKTREE:-}" ]; then
-    git -C "$MANAGED_REPO" reset --quiet --hard "$REMOTE_HEAD" >"$WORK_ROOT/reset.log" 2>&1 || die "installed view is valid but managed clone could not advance"
+    git -C "$MANAGED_REPO" reset --quiet --hard "$CANDIDATE_REVISION" >"$WORK_ROOT/reset.log" 2>&1 || die "installed view is valid but managed clone could not advance"
 fi
 commit_hook_changes
 finalize_hook_ownership

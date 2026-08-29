@@ -38,7 +38,9 @@ state. During initial installation, the installer must:
 Different configured origins are independent catalogs even if their manifests match. The origin
 value is untrusted input: do not execute it, interpolate it into shell source, or expose embedded
 credentials in logs. Changing `origin` later intentionally changes where that existing clone
-updates; it does not grant access to another catalog's state.
+fetches; it does not grant access to another catalog's state. The fetched default-branch commit
+must remain a fast-forward from the managed revision. Moving to an unrelated-history origin
+requires removing the old instance and installing the new origin explicitly.
 
 Repository URLs are allowed only at initial bootstrap boundaries and in explanatory documentation.
 Every fetch, pull, status check, or recovery operation after cloning must derive its remote from

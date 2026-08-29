@@ -54,7 +54,9 @@ Each installed catalog has its own hook entry, lock, throttle, and managed clone
 contains only the catalog instance key and the path to the lifecycle script in that clone; it does
 not contain or persist the bootstrap URL. Update work reads installed instances from owned state,
 fetches only each clone's configured `origin` with Git prompting disabled, and reconciles every
-installed prefix through the same validation and transactional activation used by `install`.
+installed prefix through the same validation and transactional activation used by `install`. One
+locked catalog attempt performs one fetch and pins the resulting exact commit for every prefix.
+The commit must be a fast-forward from the managed clone's current revision.
 
 | Product | User configuration | Installed event |
 | --- | --- | --- |
@@ -168,6 +170,14 @@ failure, no partial catalog exposure remains. The racing or user-owned path is n
 Interrupted temporary work is removed during process cleanup; validated generations are immutable
 and activation is atomic at the `current` link.
 
+A candidate is rejected before clone advancement unless it contains regular, non-symlinked copies
+of all three lifecycle files (`team-skills.sh`, `team-skills-json.awk`, and `team-skills.ps1`) and
+the native lifecycle script parses successfully. Rewritten, downgraded, or unrelated default-branch
+history is also rejected. To move an installation to an origin with unrelated history, remove each
+prefix using its original bootstrap selector, then install the new origin as a new instance. A
+same-history mirror may be configured as `origin` and continues only when its candidate is a
+fast-forward.
+
 The last hook-launched diagnostic for a catalog is written atomically to
 `catalogs/<instance-key>/last-update.log` below the state root. Origin values and Git clone/fetch
 diagnostics are suppressed so credential-bearing remotes are not printed. The log retains at most
@@ -200,4 +210,5 @@ See [the catalog contract](docs/catalog-contract.md) for exact multi-catalog sem
 [the authoring guide](docs/skill-authoring.md) for the portable subset. See
 [operations and troubleshooting](docs/operations.md) for lifecycle architecture and recovery, and
 [manual verification](docs/manual-verification.md) for the repeatable disposable fixture, pending
-results template, and WSL/product checks that still require a human.
+results template, and WSL/product checks that still require a human. The bounded Milestone 5
+[security review](docs/security-review.md) records trust boundaries and residual risks.

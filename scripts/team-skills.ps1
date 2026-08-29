@@ -10,7 +10,11 @@ param(
 
     [Parameter(Position = 2)]
     [AllowEmptyString()]
-    [string]$Prefix
+    [string]$Prefix,
+
+    [Parameter(Position = 3)]
+    [AllowEmptyString()]
+    [string]$CandidateRevision
 )
 
 Set-StrictMode -Version 2.0
@@ -69,7 +73,14 @@ function Get-FullSafeRoot([string]$Value, [string]$Label) {
     if ($full.TrimEnd('\', '/') -eq $pathRoot.TrimEnd('\', '/')) {
         Fail "$Label must not be a filesystem root"
     }
-    return $full.TrimEnd('\', '/')
+    $normalized = $full.TrimEnd('\', '/')
+    if ([System.IO.File]::Exists($normalized) -or [System.IO.Directory]::Exists($normalized)) {
+        $item = Get-Item -Force -LiteralPath $normalized
+        if ([bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            Fail "$Label must not be a reparse point"
+        }
+    }
+    return $normalized
 }
 
 function Test-PathEntry([string]$Path) {
@@ -505,7 +516,32 @@ function Test-Skill([string]$SkillDirectory, [string]$ExpectedName) {
     return $closed -and $names.Count -eq 1 -and $names[0] -ceq $ExpectedName
 }
 
+function Test-CatalogRuntime([string]$CatalogRoot) {
+    $scriptsRoot = Join-Path $CatalogRoot 'scripts'
+    if (-not (Test-PathEntry $scriptsRoot)) { return $false }
+    $scriptsItem = Get-Item -Force -LiteralPath $scriptsRoot
+    if (-not ($scriptsItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $scriptsItem)) {
+        return $false
+    }
+    foreach ($name in @('team-skills.sh', 'team-skills-json.awk', 'team-skills.ps1')) {
+        $path = Join-Path $scriptsRoot $name
+        if (-not (Test-PathEntry $path)) { return $false }
+        $item = Get-Item -Force -LiteralPath $path
+        if (-not ($item -is [System.IO.FileInfo]) -or (Test-ReparsePoint $item)) { return $false }
+    }
+    try {
+        $tokens = $null
+        $errors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $scriptsRoot 'team-skills.ps1'), [ref]$tokens, [ref]$errors
+        ) | Out-Null
+        return $errors.Count -eq 0
+    }
+    catch { return $false }
+}
+
 function Read-Catalog([string]$CatalogRoot) {
+    if (-not (Test-CatalogRuntime $CatalogRoot)) { return $null }
     $manifestPath = Join-Path $CatalogRoot "catalog.json"
     if (-not (Test-PathEntry $manifestPath)) { return $null }
     $manifestItem = Get-Item -Force -LiteralPath $manifestPath
@@ -809,6 +845,24 @@ function Invoke-CatalogUpdate([string]$InstanceKey) {
         $updateFailed = $false
         $powerShellExecutable = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         $env:GIT_TERMINAL_PROMPT = "0"
+        $managedRepo = Join-Path $instanceRoot 'repo'
+        try {
+            $updatePrevious = Get-GitValue @('-C', $managedRepo, 'rev-parse', 'HEAD') "managed catalog clone has no Git revision"
+            $captured = ""
+            if ((Invoke-Git @('-C', $managedRepo, 'fetch', '--quiet', 'origin') ([ref]$captured)) -ne 0) {
+                Fail "unable to fetch the managed catalog origin"
+            }
+            $updateRemoteHead = Get-GitValue @('-C', $managedRepo, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD') "managed origin has no default branch"
+            $updateCandidate = Get-GitValue @('-C', $managedRepo, 'rev-parse', ($updateRemoteHead + '^{commit}')) "managed origin default branch has no commit"
+            $captured = ""
+            if ((Invoke-Git @('-C', $managedRepo, 'merge-base', '--is-ancestor', $updatePrevious, $updateCandidate) ([ref]$captured)) -ne 0) {
+                Fail "fetched catalog history is not a fast-forward; keeping the last known-good installation"
+            }
+        }
+        catch {
+            Write-UpdateDiagnostic ("error: " + $_.Exception.Message)
+            return $false
+        }
         foreach ($installedView in $installedViews) {
             $installedKey = $installedView.Name
             if ($installedKey -cne "_default" -and -not (Test-PortableName $installedKey 62)) {
@@ -820,7 +874,7 @@ function Invoke-CatalogUpdate([string]$InstanceKey) {
             $ErrorActionPreference = "Continue"
             try {
                 $childOutput = @(& $powerShellExecutable -NoLogo -NoProfile -NonInteractive `
-                    -ExecutionPolicy Bypass -File $ScriptPath update-prefix $InstanceKey $installedKey 2>&1)
+                    -ExecutionPolicy Bypass -File $ScriptPath update-prefix $InstanceKey $installedKey $updateCandidate 2>&1)
                 $childExitCode = $LASTEXITCODE
             }
             finally {
@@ -1214,13 +1268,31 @@ try {
     }
     else {
         $script:PreviousRepoHead = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', 'HEAD') "managed catalog clone has no Git revision"
-        $captured = ""
-        if ((Invoke-Git @('-C', $ManagedRepo, 'fetch', '--quiet', 'origin') ([ref]$captured)) -ne 0) {
-            Fail "unable to fetch the managed catalog origin"
+        if (-not [string]::IsNullOrEmpty($CandidateRevision)) {
+            if ($CandidateRevision -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$') {
+                Fail "pinned catalog candidate is invalid"
+            }
+            $remoteHead = Get-GitValue @('-C', $ManagedRepo, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD') "managed origin has no default branch"
+            $candidateRevisionResolved = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', ($remoteHead + '^{commit}')) "managed origin default branch has no commit"
+            if ($candidateRevisionResolved -cne $CandidateRevision) {
+                Fail "managed origin candidate changed during catalog update"
+            }
+            $candidateRevision = $candidateRevisionResolved
         }
-        $remoteHead = Get-GitValue @('-C', $ManagedRepo, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD') "managed origin has no default branch"
+        else {
+            $captured = ""
+            if ((Invoke-Git @('-C', $ManagedRepo, 'fetch', '--quiet', 'origin') ([ref]$captured)) -ne 0) {
+                Fail "unable to fetch the managed catalog origin"
+            }
+            $remoteHead = Get-GitValue @('-C', $ManagedRepo, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD') "managed origin has no default branch"
+            $candidateRevision = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', ($remoteHead + '^{commit}')) "managed origin default branch has no commit"
+        }
+        $captured = ""
+        if ((Invoke-Git @('-C', $ManagedRepo, 'merge-base', '--is-ancestor', $script:PreviousRepoHead, $candidateRevision) ([ref]$captured)) -ne 0) {
+            Fail "fetched catalog history is not a fast-forward; keeping the last known-good installation"
+        }
         $CandidateWorktree = Join-Path $WorkRoot "candidate"
-        if ((Invoke-Git @('-C', $ManagedRepo, 'worktree', 'add', '--quiet', '--detach', $CandidateWorktree, $remoteHead) ([ref]$captured)) -ne 0) {
+        if ((Invoke-Git @('-C', $ManagedRepo, 'worktree', 'add', '--quiet', '--detach', $CandidateWorktree, $candidateRevision) ([ref]$captured)) -ne 0) {
             Fail "unable to stage the fetched catalog"
         }
         $sourceRoot = $CandidateWorktree
@@ -1352,7 +1424,7 @@ try {
 
     if ($null -ne $CandidateWorktree) {
         $captured = ""
-        if ((Invoke-Git @('-C', $ManagedRepo, 'reset', '--quiet', '--hard', $remoteHead) ([ref]$captured)) -ne 0) {
+        if ((Invoke-Git @('-C', $ManagedRepo, 'reset', '--quiet', '--hard', $candidateRevision) ([ref]$captured)) -ne 0) {
             Fail "installed view is valid but managed clone could not advance"
         }
     }

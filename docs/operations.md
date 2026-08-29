@@ -42,9 +42,10 @@ and always reports success to the product. The updater then:
 1. validates the instance state and acquires that catalog's lock;
 2. exits successfully without a fetch when another owner holds the lock or the last complete
    success is younger than the throttle;
-3. reads the managed clone's current `origin`, fetches it with terminal prompting disabled, and
-   enumerates every installed prefix;
-4. validates a candidate and transactionally activates each view using the installer rules; and
+3. reads the managed clone's current `origin`, fetches it once with terminal prompting disabled,
+   requires a fast-forward, and pins that exact candidate commit for every installed prefix;
+4. validates the candidate lifecycle runtime and catalog, then transactionally activates each view
+   using the installer rules; and
 5. records `last-success` only after all installed views reconcile successfully.
 
 No catalog failure prevents `update-all` from attempting the remaining catalogs. No update path
@@ -145,9 +146,16 @@ rolled back. Correct or restore the file, preserve its unrelated fields, and rer
 The current generation and exposures remain active. Hook logs use fixed diagnostics, suppress Git
 fetch output so credential-bearing origins are not exposed, and atomically retain at most the final
 64 KiB from the latest attempt. Correct authentication, network access, the clone's configured
-origin, or the remote catalog, then wait for the next eligible session or run `update-all`. An
-origin may be deliberately changed with `git remote set-url origin` inside the managed clone; later
-updates follow that value without changing instance ownership.
+origin, or the remote catalog, then wait for the next eligible session or run `update-all`. A
+same-history mirror may be selected with `git remote set-url origin` inside the managed clone;
+updates follow it only while the fetched commit fast-forwards the installed revision. For a new or
+rewritten history, remove every prefix with the original bootstrap selector and install the new
+origin explicitly. Team Skills intentionally has no automatic downgrade or history-adoption flag.
+
+Candidate validation requires regular, non-reparse lifecycle files for POSIX and Windows and a
+successful native parser check before managed-clone advancement. Therefore a missing, linked, or
+syntactically malformed self-update stays staged only in Git object storage and is never selected
+as the next session's managed runtime.
 
 ### A lock remains after interruption
 
