@@ -872,13 +872,10 @@ function Invoke-HookLaunch([string]$InstanceKey) {
         $start = [System.Diagnostics.ProcessStartInfo]::new()
         $start.FileName = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         $start.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + $encoded
-        $start.UseShellExecute = $false
+        $start.UseShellExecute = $true
         $start.CreateNoWindow = $true
-        $start.RedirectStandardInput = $true
-        $start.RedirectStandardOutput = $true
-        $start.RedirectStandardError = $true
+        $start.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $process = [System.Diagnostics.Process]::Start($start)
-        $process.StandardInput.Close()
         $process.Dispose()
     }
     catch { }
@@ -992,8 +989,7 @@ try {
 
     if ($Action -ceq "hook") {
         Invoke-HookLaunch $RepositoryUrl
-        [Environment]::ExitCode = 0
-        return
+        exit 0
     }
     if ($Action -ceq "update-instance") {
         $script:UpdateDiagnostics.Clear()
@@ -1010,20 +1006,18 @@ try {
                 catch { }
             }
         }
-        [Environment]::ExitCode = if ($updated) { 0 } else { 1 }
-        return
+        if ($updated) { exit 0 }
+        exit 1
     }
     if ($Action -ceq "update-all") {
         $catalogsRoot = Join-Path $StateRoot "catalogs"
         if (-not (Test-PathEntry $catalogsRoot)) {
-            [Environment]::ExitCode = 0
-            return
+            exit 0
         }
         $catalogsItem = Get-Item -Force -LiteralPath $catalogsRoot
         if (-not ($catalogsItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $catalogsItem)) {
             [Console]::Error.WriteLine("error: catalog state root is invalid")
-            [Environment]::ExitCode = 1
-            return
+            exit 1
         }
         $overallSuccess = $true
         foreach ($catalog in @(Get-ChildItem -Force -LiteralPath $catalogsRoot)) {
@@ -1032,8 +1026,8 @@ try {
             }
             if (-not (Invoke-CatalogUpdate $catalog.Name)) { $overallSuccess = $false }
         }
-        [Environment]::ExitCode = if ($overallSuccess) { 0 } else { 1 }
-        return
+        if ($overallSuccess) { exit 0 }
+        exit 1
     }
     if ($Action -ceq "update-prefix" -and
             ([string]::IsNullOrWhiteSpace($RepositoryUrl) -or -not $PrefixWasSupplied)) {
