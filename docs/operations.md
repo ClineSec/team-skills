@@ -85,6 +85,10 @@ state, exposure, and hook paths have explicit environment overrides described in
 are useful for managed environments and tests, but a product reads an override file only if that
 product is also launched in the corresponding disposable environment.
 
+Atomic hook replacement preserves an existing file's POSIX mode or Windows access-control list.
+New POSIX hook files are created with mode `0600`; new Windows files inherit access control from
+their product configuration directory.
+
 ## Throttle, lock, and visibility
 
 The default throttle is 21,600 seconds (six hours) per catalog. It starts after a completely

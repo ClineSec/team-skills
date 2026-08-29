@@ -49,12 +49,22 @@ function hex_value(character) {
 
 function ascii_character(value) {
     if (!ascii_ready) {
-        for (ascii_index = 1; ascii_index < 128; ascii_index++) {
+        for (ascii_index = 0; ascii_index < 128; ascii_index++) {
             ascii_table[ascii_index] = sprintf("%c", ascii_index)
         }
         ascii_ready = 1
     }
     return ascii_table[value]
+}
+
+function is_json_control(character,    value) {
+    # Compare explicitly so behavior does not depend on locale character classes.
+    # Awk implementations that expose an input NUL can match sprintf("%c", 0);
+    # implementations that truncate at NUL reject the resulting incomplete JSON.
+    for (value = 0; value < 32; value++) {
+        if (character == ascii_character(value)) return 1
+    }
+    return 0
 }
 
 function decode_string(raw,    result, index_value, character, escape, hex, value) {
@@ -95,7 +105,7 @@ function parse_string(    start, character, escape, hex) {
             position++
             return new_node("string", substr(document, start, position - start))
         }
-        if (character == "\n" || character == "\r") fail("unescaped control character in string")
+        if (is_json_control(character)) fail("unescaped control character in string")
         if (character == "\\") {
             position++
             escape = substr(document, position, 1)

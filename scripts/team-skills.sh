@@ -134,7 +134,7 @@ prepare_hook_edit() {
 
     if [ -e "$hook_config" ] || [ -L "$hook_config" ]; then
         [ -f "$hook_config" ] && [ ! -L "$hook_config" ] || die "$hook_product hook configuration is not a regular file"
-        cp "$hook_config" "$hook_before" || die "cannot stage $hook_product hook configuration"
+        cp -p "$hook_config" "$hook_before" || die "cannot stage $hook_product hook configuration"
         : >"$hook_existed"
     else
         printf '{}\n' >"$hook_before"
@@ -198,7 +198,7 @@ rollback_hook_changes() {
         if [ -f "$hook_config" ] && [ ! -L "$hook_config" ] && cmp -s "$hook_config" "$hook_stage/after.json"; then
             if [ -f "$hook_stage/existed" ]; then
                 hook_restore=$hook_config.team-skills-rollback.$$
-                cp "$hook_stage/before.json" "$hook_restore" && mv "$hook_restore" "$hook_config" || hook_rollback_failed=1
+                cp -p "$hook_stage/before.json" "$hook_restore" && mv "$hook_restore" "$hook_config" || hook_rollback_failed=1
             else
                 rm "$hook_config" || hook_rollback_failed=1
             fi
@@ -239,7 +239,21 @@ commit_hook_changes() {
             die "cannot create $hook_product configuration directory"
         }
         hook_temp=$hook_parent/.team-skills-hooks.$$
-        if ! cp "$hook_stage/after.json" "$hook_temp" || ! mv "$hook_temp" "$hook_config"; then
+        if [ -f "$hook_stage/existed" ]; then
+            # Seed the replacement from the staged original so POSIX cp -p carries
+            # its mode forward, then replace only the bytes before the atomic move.
+            if ! cp -p "$hook_stage/before.json" "$hook_temp" || \
+                ! cat "$hook_stage/after.json" >"$hook_temp"; then
+                rm -f "$hook_temp"
+                rollback_hook_changes || :
+                die "cannot preserve $hook_product hook configuration metadata"
+            fi
+        elif ! (umask 077; cp "$hook_stage/after.json" "$hook_temp"); then
+            rm -f "$hook_temp"
+            rollback_hook_changes || :
+            die "cannot create secure $hook_product hook configuration"
+        fi
+        if ! mv "$hook_temp" "$hook_config"; then
             rm -f "$hook_temp"
             rollback_hook_changes || :
             die "cannot atomically update $hook_product hook configuration"

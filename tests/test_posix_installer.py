@@ -190,6 +190,74 @@ class PosixInstallerTests(unittest.TestCase):
         for product, command in commands.items():
             self.assertEqual(serialized[product].count(command), 1)
 
+    def test_hook_config_modes_survive_install_reinstall_rollback_and_removal(self) -> None:
+        _, origin = self.make_catalog("private-hooks", "# Private hooks")
+        hook_paths = {
+            "claude": self.home / ".claude" / "settings.json",
+            "codex": self.home / ".codex" / "hooks.json",
+            "cursor": self.home / ".cursor" / "hooks.json",
+        }
+        for product, path in hook_paths.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"foreign": product}) + "\n", encoding="utf-8")
+            path.chmod(0o600)
+
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        for path in hook_paths.values():
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+        repeated = self.run_installer("install", origin)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        before_rollback = {product: path.read_bytes() for product, path in hook_paths.items()}
+        for path in hook_paths.values():
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+        command_bin = self.base / "hook owner failure bin"
+        command_bin.mkdir()
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        mv_wrapper = command_bin / "mv"
+        mv_wrapper.write_text(
+            "#!/bin/sh\n"
+            "for argument do\n"
+            "  case $argument in\n"
+            "    */hooks/.claude.owner.*) exit 97 ;;\n"
+            "  esac\n"
+            "done\n"
+            'exec "$TEAM_SKILLS_TEST_REAL_MV" "$@"\n',
+            encoding="utf-8",
+        )
+        mv_wrapper.chmod(0o755)
+        original_path = self.env["PATH"]
+        self.env["PATH"] = str(command_bin) + os.pathsep + original_path
+        self.env["TEAM_SKILLS_TEST_REAL_MV"] = real_mv or ""
+
+        rolled_back = self.run_installer("install", origin)
+        self.assertNotEqual(rolled_back.returncode, 0)
+        self.assertIn("cannot record claude hook ownership", rolled_back.stderr)
+        for product, path in hook_paths.items():
+            self.assertEqual(path.read_bytes(), before_rollback[product])
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+        self.env["PATH"] = original_path
+        removed = self.run_installer("remove", origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        for product, path in hook_paths.items():
+            self.assertEqual(self.read_hook_config(product)["foreign"], product)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_new_hook_configs_use_private_mode(self) -> None:
+        _, origin = self.make_catalog("new-private-hooks", "# Private defaults")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        for path in (
+            self.home / ".claude" / "settings.json",
+            self.home / ".codex" / "hooks.json",
+            self.home / ".cursor" / "hooks.json",
+        ):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
     def test_two_catalog_hook_entries_coexist_and_one_removal_is_exact(self) -> None:
         _, first_origin = self.make_catalog("first-hooks", "# First hooks")
         _, second_origin = self.make_catalog("second-hooks", "# Second hooks")
@@ -252,7 +320,7 @@ class PosixInstallerTests(unittest.TestCase):
         _, origin = self.make_catalog("malformed-hooks", "# Hooks")
         claude_config = self.home / ".claude" / "settings.json"
         claude_config.parent.mkdir(parents=True)
-        malformed = b'{"hooks":'
+        malformed = b'{"foreign":"literal\tcontrol"}\n'
         claude_config.write_bytes(malformed)
 
         installed = self.run_installer("install", origin)

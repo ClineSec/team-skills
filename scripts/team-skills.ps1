@@ -290,11 +290,16 @@ function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigP
     $beforePath = Join-Path $stageRoot 'before.json'
     $afterPath = Join-Path $stageRoot 'after.json'
     $existed = Test-PathEntry $ConfigPath
+    $accessControl = $null
     if ($existed) {
         $item = Get-Item -Force -LiteralPath $ConfigPath
         if (-not ($item -is [System.IO.FileInfo]) -or (Test-ReparsePoint $item)) {
             Fail "$Product hook configuration is not a regular file"
         }
+        try {
+            $accessControl = Get-Acl -LiteralPath $ConfigPath -ErrorAction Stop
+        }
+        catch { Fail "cannot preserve $Product hook configuration access protection" }
         [System.IO.File]::WriteAllBytes($beforePath, [System.IO.File]::ReadAllBytes($ConfigPath))
         $beforeText = Read-Utf8Text $beforePath
     }
@@ -310,6 +315,7 @@ function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigP
         BeforePath = $beforePath
         AfterPath = $afterPath
         Existed = $existed
+        AccessControl = $accessControl
         Committed = $false
     }
 }
@@ -374,6 +380,7 @@ function Rollback-HookChanges {
                     $parent = [System.IO.Path]::GetDirectoryName($stage.ConfigPath)
                     $temporary = Join-Path $parent ('.team-skills-rollback.' + [guid]::NewGuid().ToString('N'))
                     [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.BeforePath))
+                    Set-Acl -LiteralPath $temporary -AclObject $stage.AccessControl -ErrorAction Stop
                     Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
                 }
                 else {
@@ -410,6 +417,9 @@ function Commit-HookChanges {
         $temporary = Join-Path $parent ('.team-skills-hooks.' + [guid]::NewGuid().ToString('N'))
         try {
             [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.AfterPath))
+            if ($stage.Existed) {
+                Set-Acl -LiteralPath $temporary -AclObject $stage.AccessControl -ErrorAction Stop
+            }
             Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
             $stage.Committed = $true
         }

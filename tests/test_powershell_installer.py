@@ -156,6 +156,57 @@ class PowerShellInstallerTests(unittest.TestCase):
             for product in ("claude", "codex", "cursor")
         }
 
+    def protect_and_read_acl(self, path: Path) -> str:
+        assert POWERSHELL
+        environment = self.env.copy()
+        environment["TEAM_SKILLS_TEST_ACL_PATH"] = str(path)
+        result = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "$ErrorActionPreference = 'Stop'; "
+                "$acl = Get-Acl -LiteralPath $env:TEAM_SKILLS_TEST_ACL_PATH; "
+                "$acl.SetAccessRuleProtection($true, $true); "
+                "Set-Acl -LiteralPath $env:TEAM_SKILLS_TEST_ACL_PATH -AclObject $acl; "
+                "(Get-Acl -LiteralPath $env:TEAM_SKILLS_TEST_ACL_PATH).Sddl",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip().splitlines()[-1]
+
+    def read_acl(self, path: Path) -> str:
+        assert POWERSHELL
+        environment = self.env.copy()
+        environment["TEAM_SKILLS_TEST_ACL_PATH"] = str(path)
+        result = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "$ErrorActionPreference = 'Stop'; "
+                "(Get-Acl -LiteralPath $env:TEAM_SKILLS_TEST_ACL_PATH).Sddl",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip().splitlines()[-1]
+
     def test_hook_registration_preserves_foreign_config_and_is_idempotent(self) -> None:
         _, origin = self.make_catalog("hooks", "# Hooks")
         for path in (self.claude_hooks, self.codex_hooks, self.cursor_hooks):
@@ -212,6 +263,35 @@ class PowerShellInstallerTests(unittest.TestCase):
                 for product in ("claude", "codex", "cursor")
             },
         )
+
+    def test_hook_config_acls_survive_install_reinstall_and_removal(self) -> None:
+        _, origin = self.make_catalog("protected-hooks", "# Protected hooks")
+        hook_paths = {
+            "claude": self.claude_hooks,
+            "codex": self.codex_hooks,
+            "cursor": self.cursor_hooks,
+        }
+        expected_acls = {}
+        for product, path in hook_paths.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"foreign": product}) + "\n", encoding="utf-8")
+            expected_acls[product] = self.protect_and_read_acl(path)
+
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        for product, path in hook_paths.items():
+            self.assertEqual(self.read_acl(path), expected_acls[product])
+
+        repeated = self.run_installer("install", origin)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        for product, path in hook_paths.items():
+            self.assertEqual(self.read_acl(path), expected_acls[product])
+
+        removed = self.run_installer("remove", origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        for product, path in hook_paths.items():
+            self.assertEqual(self.read_hook_config(product)["foreign"], product)
+            self.assertEqual(self.read_acl(path), expected_acls[product])
 
     def test_two_catalog_hooks_coexist_and_one_removal_is_exact(self) -> None:
         _, first_origin = self.make_catalog("first-hooks", "# First hooks")

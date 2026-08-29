@@ -39,6 +39,30 @@ class PosixJsonEditorTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
 
+    def test_check_rejects_every_raw_json_control_byte(self) -> None:
+        environment = os.environ.copy()
+        for value in range(0x20):
+            with self.subTest(value=value):
+                source = b'{"foreign":"a' + bytes([value]) + b'b"}\n'
+                result = subprocess.run(
+                    ["awk", "-voperation=check", "-f", str(EDITOR)],
+                    input=source,
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+
+        permitted = subprocess.run(
+            ["awk", "-voperation=check", "-f", str(EDITOR)],
+            input=b'{"foreign":"a\x7fb"}\n',
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+        self.assertEqual(permitted.returncode, 0, permitted.stderr)
+
     def test_claude_add_is_structural_preserving_and_idempotent(self) -> None:
         source = json.dumps(
             {
