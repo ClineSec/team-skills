@@ -8,5 +8,5 @@ the local clone's configured `origin`, never a baked-in upstream URL.
 The catalog prefix is blank by default. Existing unprefixed installations win collisions, which
 must produce a visible warning, skip the new skill, preserve existing state, and still succeed.
 Nonblank prefixes require a generated view with matching directory and rewritten `name`; renaming
-a symlink is invalid. Work directly on `main`, validate before committing, and do not implement the
-installer or lifecycle hooks as part of the repository foundation.
+a symlink is invalid. Work directly on `main`, validate before committing, and use only disposable
+homes, state roots, skill roots, hook files, and local origins for runtime tests.

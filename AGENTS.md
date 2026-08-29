@@ -15,5 +15,5 @@ contract documented in `docs/skill-authoring.md`.
   can safely ignore it. Prefer relative references and standard-library, cross-platform helpers.
 - This repository uses direct commits to `main`. Run `python3 scripts/validate.py` and
   `python3 -m unittest discover -s tests -v` before committing, then push to `origin/main`.
-- Do not add installer, updater, lifecycle-hook, release, or publishing behavior during foundation
-  work unless the ticket explicitly advances that milestone.
+- Keep installer, updater, lifecycle-hook, test-fixture, release, and publishing changes within the
+  ticket's explicit scope. Never test runtime changes against a real user profile.

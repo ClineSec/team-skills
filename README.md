@@ -199,5 +199,5 @@ The canonical format follows the primary documentation reviewed on 2026-08-29:
 See [the catalog contract](docs/catalog-contract.md) for exact multi-catalog semantics and
 [the authoring guide](docs/skill-authoring.md) for the portable subset. See
 [operations and troubleshooting](docs/operations.md) for lifecycle architecture and recovery, and
-[manual verification](docs/manual-verification.md) for disposable WSL and product checks that still
-require a human.
+[manual verification](docs/manual-verification.md) for the repeatable disposable fixture, pending
+results template, and WSL/product checks that still require a human.

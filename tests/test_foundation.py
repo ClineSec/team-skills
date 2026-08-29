@@ -82,6 +82,18 @@ class FoundationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds 64"):
             validator.effective_skill_name("a" * 40, "b" * 24)
 
+    def test_operational_code_has_no_baked_host_owner_or_upstream(self) -> None:
+        operational_paths = (
+            ROOT / "scripts" / "team-skills.sh",
+            ROOT / "scripts" / "team-skills.ps1",
+            ROOT / "scripts" / "team-skills-json.awk",
+        )
+        forbidden = ("appsecthings", "github.com", "raw.githubusercontent.com", "your-org")
+        for path in operational_paths:
+            text = path.read_text(encoding="utf-8").lower()
+            for value in forbidden:
+                self.assertNotIn(value, text, f"{path} contains baked upstream value {value}")
+
     def test_creator_scaffolds_a_complete_portable_skill(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

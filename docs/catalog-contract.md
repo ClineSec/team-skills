@@ -1,7 +1,7 @@
 # Catalog contract v1
 
-This document is normative for installer and updater milestones. “Must” describes behavior later
-operational code has to preserve; it does not mean that behavior is implemented in milestone 1.
+This document is normative for catalog validation, installation, updating, and removal. “Must”
+describes behavior that operational code and its tests preserve.
 
 ## Canonical repository
 
@@ -26,7 +26,7 @@ than being guessed by older operational code.
 ## Catalog instance identity
 
 Forks may retain the same manifest. Therefore `catalog_id` alone must never identify installed
-state. During initial installation, the future installer must:
+state. During initial installation, the installer must:
 
 1. clone the explicitly supplied bootstrap URL;
 2. read the clone's configured fetch URL with the equivalent of
@@ -45,9 +45,9 @@ Every fetch, pull, status check, or recovery operation after cloning must derive
 the clone's currently configured `origin`. Operational code must not contain an AppSecThings,
 GitHub, or other fallback upstream.
 
-The precise state-root layout and digest encoding are milestone-2 implementation details. They
-must be deterministic, credential-safe, collision-resistant, and work on macOS, Linux, native
-Windows, and WSL.
+The state-root layout and digest encoding are documented in `docs/operations.md`. They must remain
+deterministic, credential-safe, collision-resistant, and work on macOS, Linux, native Windows, and
+WSL.
 
 ## Effective skill names
 
@@ -63,7 +63,7 @@ state.
 
 ## Blank-prefix view and collisions
 
-With a blank prefix, the future installer may expose a canonical skill through a direct directory
+With a blank prefix, the installer may expose a canonical skill through a direct directory
 symlink where a product supports it. It must never replace a pre-existing destination it does not
 already own for the same catalog instance.
 
@@ -81,7 +81,7 @@ the same decision and must not accumulate alternate names or stale temporary pat
 ## Nonblank-prefix generated view
 
 Renaming a symlink is not portable because its target still declares the original frontmatter
-name. For every nonblank prefix, later code must materialize a catalog-owned generated view:
+name. For every nonblank prefix, the installer must materialize a catalog-owned generated view:
 
 ```text
 generated/<prefix>/acme-example-skill/
@@ -97,12 +97,12 @@ permissions needed for executable helpers, and relative paths. It must not modif
 source. The complete view must validate before it can replace the previous catalog-owned view;
 failed generation retains the last known-good view.
 
-Generated output is state, not authored catalog content, and must not be committed. Its exact
-location and atomic replacement mechanism are deferred to the installer/updater milestones.
+Generated output is state, not authored catalog content, and must not be committed. Its location
+and atomic replacement mechanism follow the owned generation layout in `docs/operations.md`.
 
 ## Ownership and safe failure
 
-Later lifecycle code may mutate only paths recorded as owned by its catalog instance. It must not
+Lifecycle code may mutate only paths recorded as owned by its catalog instance. It must not
 delete or overwrite unrelated skills, other catalog clones/views/state, or existing product hook
 configuration. Unsupported schemas, malformed skills, invalid paths, failed fetches, failed view
 generation, and interrupted updates must fail safely while retaining the last known-good installed

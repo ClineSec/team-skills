@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the Team Skills foundation and every canonical skill."""
+"""Validate the Team Skills catalog contract and every canonical skill."""
 
 from __future__ import annotations
 

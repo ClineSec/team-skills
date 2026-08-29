@@ -22,5 +22,26 @@ jobs:
           python-version: "3.9"
       - name: Validate catalog
         run: python scripts/validate.py
+      - name: Validate POSIX shell syntax
+        if: runner.os != 'Windows'
+        run: sh -n scripts/team-skills.sh
+      - name: Validate native Windows PowerShell syntax
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "scripts/team-skills.ps1"), [ref]$tokens, [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
       - name: Run catalog and installer tests
         run: python -m unittest discover -s tests -v
+      - name: Verify tests left tracked files unchanged
+        shell: bash
+        run: |
+          git diff --check
+          test -z "$(git status --porcelain --untracked-files=no)"
