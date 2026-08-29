@@ -109,7 +109,7 @@ class PowerShellInstallerTests(unittest.TestCase):
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "Remove-Item -Force -LiteralPath $args[0]",
+                "[IO.Directory]::Delete($args[0])",
                 str(path),
             ],
             text=True,

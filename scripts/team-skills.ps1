@@ -175,6 +175,15 @@ function New-DirectoryExposure([string]$Path, [string]$Target) {
     }
 }
 
+function Remove-DirectoryExposure([string]$Path) {
+    $item = Get-Item -Force -LiteralPath $Path
+    if (-not ($item -is [System.IO.DirectoryInfo]) -or -not (Test-ReparsePoint $item)) {
+        Fail "refusing to remove a path that is not a directory link: $Path"
+    }
+    # Directory.Delete removes the junction/symlink itself and never traverses its target.
+    [System.IO.Directory]::Delete($Path)
+}
+
 function Get-LinkTarget([string]$Path) {
     try {
         $item = Get-Item -Force -LiteralPath $Path
@@ -208,7 +217,7 @@ function Activate-Generation([string]$InstallRoot, [string]$GenerationPath) {
         return
     }
     if ($null -eq (Get-LinkTarget $current)) {
-        Remove-Item -Force -LiteralPath $next
+        Remove-DirectoryExposure $next
         Fail "catalog current view is not an owned directory link"
     }
     Move-Item -LiteralPath $current -Destination $previous
@@ -217,10 +226,10 @@ function Activate-Generation([string]$InstallRoot, [string]$GenerationPath) {
     }
     catch {
         Move-Item -LiteralPath $previous -Destination $current
-        if (Test-PathEntry $next) { Remove-Item -Force -LiteralPath $next }
+        if (Test-PathEntry $next) { Remove-DirectoryExposure $next }
         throw
     }
-    Remove-Item -Force -LiteralPath $previous
+    Remove-DirectoryExposure $previous
 }
 
 try {
@@ -308,7 +317,7 @@ try {
                 $destination = Join-Path $productRoot $effectiveName
                 $expectedTarget = ([System.IO.File]::ReadAllText($ownerFile.FullName)).Trim()
                 if (Test-OwnedExposure $destination $expectedTarget) {
-                    Remove-Item -Force -LiteralPath $destination
+                    Remove-DirectoryExposure $destination
                 }
                 elseif (Test-PathEntry $destination) {
                     [Console]::Error.WriteLine("warning: not removing changed path $destination")
@@ -417,7 +426,7 @@ try {
             $destination = Join-Path $productRoot $ownedName
             $expectedTarget = ([System.IO.File]::ReadAllText($ownerFile.FullName)).Trim()
             if (Test-OwnedExposure $destination $expectedTarget) {
-                Remove-Item -Force -LiteralPath $destination
+                Remove-DirectoryExposure $destination
             }
             elseif (Test-PathEntry $destination) {
                 [Console]::Error.WriteLine("warning: not removing changed path $destination")
@@ -439,7 +448,7 @@ try {
                 Move-Item -LiteralPath $linkTemp -Destination $destination
             }
             catch {
-                if (Test-PathEntry $linkTemp) { Remove-Item -Force -LiteralPath $linkTemp }
+                if (Test-PathEntry $linkTemp) { Remove-DirectoryExposure $linkTemp }
                 Remove-Item -Force -LiteralPath $ownerFile
                 Fail "cannot expose skill $($generatedSkill.Name)"
             }
