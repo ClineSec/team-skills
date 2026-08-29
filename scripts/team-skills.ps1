@@ -297,7 +297,10 @@ function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigP
             Fail "$Product hook configuration is not a regular file"
         }
         try {
-            $accessControl = Get-Acl -LiteralPath $ConfigPath -ErrorAction Stop
+            $accessControl = [System.IO.File]::GetAccessControl(
+                $ConfigPath,
+                [System.Security.AccessControl.AccessControlSections]::Access
+            )
         }
         catch { Fail "cannot preserve $Product hook configuration access protection" }
         [System.IO.File]::WriteAllBytes($beforePath, [System.IO.File]::ReadAllBytes($ConfigPath))
@@ -380,7 +383,7 @@ function Rollback-HookChanges {
                     $parent = [System.IO.Path]::GetDirectoryName($stage.ConfigPath)
                     $temporary = Join-Path $parent ('.team-skills-rollback.' + [guid]::NewGuid().ToString('N'))
                     [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.BeforePath))
-                    Set-Acl -LiteralPath $temporary -AclObject $stage.AccessControl -ErrorAction Stop
+                    [System.IO.File]::SetAccessControl($temporary, $stage.AccessControl)
                     Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
                 }
                 else {
@@ -418,7 +421,7 @@ function Commit-HookChanges {
         try {
             [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.AfterPath))
             if ($stage.Existed) {
-                Set-Acl -LiteralPath $temporary -AclObject $stage.AccessControl -ErrorAction Stop
+                [System.IO.File]::SetAccessControl($temporary, $stage.AccessControl)
             }
             Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
             $stage.Committed = $true

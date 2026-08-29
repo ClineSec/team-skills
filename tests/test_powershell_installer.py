@@ -170,10 +170,12 @@ class PowerShellInstallerTests(unittest.TestCase):
                 "Bypass",
                 "-Command",
                 "$ErrorActionPreference = 'Stop'; "
-                "$acl = Get-Acl -LiteralPath $env:TEAM_SKILLS_TEST_ACL_PATH; "
+                "$sections = [System.Security.AccessControl.AccessControlSections]::Access; "
+                "$acl = [System.IO.File]::GetAccessControl($env:TEAM_SKILLS_TEST_ACL_PATH, $sections); "
                 "$acl.SetAccessRuleProtection($true, $true); "
-                "Set-Acl -LiteralPath $env:TEAM_SKILLS_TEST_ACL_PATH -AclObject $acl; "
-                "(Get-Acl -LiteralPath $env:TEAM_SKILLS_TEST_ACL_PATH).Sddl",
+                "[System.IO.File]::SetAccessControl($env:TEAM_SKILLS_TEST_ACL_PATH, $acl); "
+                "$actual = [System.IO.File]::GetAccessControl($env:TEAM_SKILLS_TEST_ACL_PATH, $sections); "
+                "$actual.GetSecurityDescriptorSddlForm($sections)",
             ],
             text=True,
             capture_output=True,
@@ -197,7 +199,9 @@ class PowerShellInstallerTests(unittest.TestCase):
                 "Bypass",
                 "-Command",
                 "$ErrorActionPreference = 'Stop'; "
-                "(Get-Acl -LiteralPath $env:TEAM_SKILLS_TEST_ACL_PATH).Sddl",
+                "$sections = [System.Security.AccessControl.AccessControlSections]::Access; "
+                "$acl = [System.IO.File]::GetAccessControl($env:TEAM_SKILLS_TEST_ACL_PATH, $sections); "
+                "$acl.GetSecurityDescriptorSddlForm($sections)",
             ],
             text=True,
             capture_output=True,
