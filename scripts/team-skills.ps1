@@ -969,7 +969,9 @@ function Invoke-CatalogUpdate([string]$InstanceKey) {
             if ((Invoke-Git @('-C', $managedRepo, 'fetch', '--quiet', 'origin', '+HEAD:refs/team-skills/candidate') ([ref]$captured)) -ne 0) {
                 Fail "unable to fetch the managed catalog origin"
             }
-            $updateCandidate = Get-GitValue @('-C', $managedRepo, 'rev-parse', '--verify', 'refs/team-skills/candidate^{commit}') "managed origin HEAD has no commit"
+            $updateCandidate = Get-GitValue @('-C', $managedRepo, 'rev-parse', '--verify', 'refs/team-skills/candidate') "managed origin HEAD has no commit"
+            $updateCandidateType = Get-GitValue @('-C', $managedRepo, 'cat-file', '-t', $updateCandidate) "managed origin HEAD has no commit"
+            if ($updateCandidateType -cne 'commit') { Fail "managed origin HEAD has no commit" }
             $captured = ""
             if ((Invoke-Git @('-C', $managedRepo, 'merge-base', '--is-ancestor', $updatePrevious, $updateCandidate) ([ref]$captured)) -ne 0) {
                 Fail "fetched catalog history is not a fast-forward; keeping the last known-good installation"
@@ -1400,7 +1402,9 @@ try {
             if ($CandidateRevision -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$') {
                 Fail "pinned catalog candidate is invalid"
             }
-            $candidateRevisionResolved = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', '--verify', ($CandidateRevision + '^{commit}')) "pinned catalog candidate is unavailable"
+            $candidateRevisionResolved = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', '--verify', $CandidateRevision) "pinned catalog candidate is unavailable"
+            $candidateRevisionType = Get-GitValue @('-C', $ManagedRepo, 'cat-file', '-t', $candidateRevisionResolved) "pinned catalog candidate is unavailable"
+            if ($candidateRevisionType -cne 'commit') { Fail "pinned catalog candidate is unavailable" }
             if ($candidateRevisionResolved -cne $CandidateRevision) {
                 Fail "managed origin candidate changed during catalog update"
             }
@@ -1411,7 +1415,9 @@ try {
             if ((Invoke-Git @('-C', $ManagedRepo, 'fetch', '--quiet', 'origin', '+HEAD:refs/team-skills/candidate') ([ref]$captured)) -ne 0) {
                 Fail "unable to fetch the managed catalog origin"
             }
-            $candidateRevision = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', '--verify', 'refs/team-skills/candidate^{commit}') "managed origin HEAD has no commit"
+            $candidateRevision = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', '--verify', 'refs/team-skills/candidate') "managed origin HEAD has no commit"
+            $candidateRevisionType = Get-GitValue @('-C', $ManagedRepo, 'cat-file', '-t', $candidateRevision) "managed origin HEAD has no commit"
+            if ($candidateRevisionType -cne 'commit') { Fail "managed origin HEAD has no commit" }
         }
         $captured = ""
         if ((Invoke-Git @('-C', $ManagedRepo, 'merge-base', '--is-ancestor', $script:PreviousRepoHead, $candidateRevision) ([ref]$captured)) -ne 0) {
