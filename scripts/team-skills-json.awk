@@ -6,7 +6,19 @@
 #   TEAM_SKILLS_JSON_COMMAND='...' awk -v operation=remove -v product=cursor -f ... hooks.json
 #
 # The implementation deliberately uses only POSIX awk. It parses the complete JSON document,
-# rejects duplicate object keys, mutates only the supported hook array, and emits valid JSON.
+# rejects duplicate object keys, malformed UTF-8, excessive size/depth, mutates only the
+# supported hook array, and emits valid JSON.
+
+function byte_character(value) {
+    if (!byte_table_ready) {
+        for (byte_index = 0; byte_index < 256; byte_index++) {
+            byte_table[byte_index] = sprintf("%c", byte_index)
+            byte_number[byte_table[byte_index]] = byte_index
+        }
+        byte_table_ready = 1
+    }
+    return byte_table[value]
+}
 
 function fail(message, status) {
     print "json editor: " message > "/dev/stderr"
@@ -47,14 +59,9 @@ function hex_value(character) {
     return index("abcdef", character) + 9
 }
 
-function ascii_character(value) {
-    if (!ascii_ready) {
-        for (ascii_index = 0; ascii_index < 128; ascii_index++) {
-            ascii_table[ascii_index] = sprintf("%c", ascii_index)
-        }
-        ascii_ready = 1
-    }
-    return ascii_table[value]
+function byte_value(character) {
+    byte_character(0)
+    return byte_number[character]
 }
 
 function is_json_control(character,    value) {
@@ -62,12 +69,68 @@ function is_json_control(character,    value) {
     # Awk implementations that expose an input NUL can match sprintf("%c", 0);
     # implementations that truncate at NUL reject the resulting incomplete JSON.
     for (value = 0; value < 32; value++) {
-        if (character == ascii_character(value)) return 1
+        if (character == byte_character(value)) return 1
     }
     return 0
 }
 
-function decode_string(raw,    result, index_value, character, escape, hex, value) {
+function utf8_character(value,    first, second, third, fourth) {
+    if (value < 128) return byte_character(value)
+    if (value < 2048) {
+        first = 192 + int(value / 64)
+        second = 128 + (value % 64)
+        return byte_character(first) byte_character(second)
+    }
+    if (value < 65536) {
+        first = 224 + int(value / 4096)
+        second = 128 + (int(value / 64) % 64)
+        third = 128 + (value % 64)
+        return byte_character(first) byte_character(second) byte_character(third)
+    }
+    first = 240 + int(value / 262144)
+    second = 128 + (int(value / 4096) % 64)
+    third = 128 + (int(value / 64) % 64)
+    fourth = 128 + (value % 64)
+    return byte_character(first) byte_character(second) byte_character(third) byte_character(fourth)
+}
+
+function validate_utf8(value,    index_value, first, second, third, fourth) {
+    for (index_value = 1; index_value <= length(value); index_value++) {
+        first = byte_value(substr(value, index_value, 1))
+        if (first < 128) continue
+        if (first >= 194 && first <= 223) {
+            second = byte_value(substr(value, ++index_value, 1))
+            if (second < 128 || second > 191) fail("invalid UTF-8")
+            continue
+        }
+        if (first >= 224 && first <= 239) {
+            second = byte_value(substr(value, ++index_value, 1))
+            third = byte_value(substr(value, ++index_value, 1))
+            if (third < 128 || third > 191 ||
+                    (first == 224 && (second < 160 || second > 191)) ||
+                    (first == 237 && (second < 128 || second > 159)) ||
+                    (first != 224 && first != 237 && (second < 128 || second > 191))) {
+                fail("invalid UTF-8")
+            }
+            continue
+        }
+        if (first >= 240 && first <= 244) {
+            second = byte_value(substr(value, ++index_value, 1))
+            third = byte_value(substr(value, ++index_value, 1))
+            fourth = byte_value(substr(value, ++index_value, 1))
+            if (third < 128 || third > 191 || fourth < 128 || fourth > 191 ||
+                    (first == 240 && (second < 144 || second > 191)) ||
+                    (first == 244 && (second < 128 || second > 143)) ||
+                    (first != 240 && first != 244 && (second < 128 || second > 191))) {
+                fail("invalid UTF-8")
+            }
+            continue
+        }
+        fail("invalid UTF-8")
+    }
+}
+
+function decode_string(raw,    result, index_value, character, escape, hex, value, low_hex, low_value) {
     result = ""
     for (index_value = 2; index_value < length(raw); index_value++) {
         character = substr(raw, index_value, 1)
@@ -77,8 +140,8 @@ function decode_string(raw,    result, index_value, character, escape, hex, valu
         }
         escape = substr(raw, ++index_value, 1)
         if (escape == "\"" || escape == "\\" || escape == "/") result = result escape
-        else if (escape == "b") result = result ascii_character(8)
-        else if (escape == "f") result = result ascii_character(12)
+        else if (escape == "b") result = result byte_character(8)
+        else if (escape == "f") result = result byte_character(12)
         else if (escape == "n") result = result "\n"
         else if (escape == "r") result = result "\r"
         else if (escape == "t") result = result "\t"
@@ -88,8 +151,21 @@ function decode_string(raw,    result, index_value, character, escape, hex, valu
                     hex_value(substr(hex, 2, 1)) * 256 + \
                     hex_value(substr(hex, 3, 1)) * 16 + \
                     hex_value(substr(hex, 4, 1))
-            if (value < 128) result = result ascii_character(value)
-            else result = result "\\u" hex
+            if (value >= 55296 && value <= 56319 && substr(raw, index_value + 5, 2) == "\\u") {
+                low_hex = substr(raw, index_value + 7, 4)
+                low_value = hex_value(substr(low_hex, 1, 1)) * 4096 + \
+                            hex_value(substr(low_hex, 2, 1)) * 256 + \
+                            hex_value(substr(low_hex, 3, 1)) * 16 + \
+                            hex_value(substr(low_hex, 4, 1))
+                if (low_hex ~ /^[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]$/ &&
+                        low_value >= 56320 && low_value <= 57343) {
+                    result = result utf8_character(65536 + (value - 55296) * 1024 + low_value - 56320)
+                    index_value += 10
+                    continue
+                }
+            }
+            if (value >= 55296 && value <= 57343) result = result "\\u" tolower(hex)
+            else result = result utf8_character(value)
             index_value += 4
         }
     }
@@ -129,11 +205,13 @@ function parse_string(    start, character, escape, hex) {
 }
 
 function parse_array(    id, child, character) {
+    if (++parse_depth > 64) fail("JSON nesting exceeds 64 levels")
     id = new_node("array", "")
     position++
     skip_space()
     if (substr(document, position, 1) == "]") {
         position++
+        parse_depth--
         return id
     }
     while (1) {
@@ -143,6 +221,7 @@ function parse_array(    id, child, character) {
         character = substr(document, position, 1)
         if (character == "]") {
             position++
+            parse_depth--
             return id
         }
         if (character != ",") fail("expected comma or closing bracket")
@@ -152,11 +231,13 @@ function parse_array(    id, child, character) {
 }
 
 function parse_object(    id, key_node, key_name, child, character, duplicate_key) {
+    if (++parse_depth > 64) fail("JSON nesting exceeds 64 levels")
     id = new_node("object", "")
     position++
     skip_space()
     if (substr(document, position, 1) == "}") {
         position++
+        parse_depth--
         return id
     }
     while (1) {
@@ -166,6 +247,9 @@ function parse_object(    id, key_node, key_name, child, character, duplicate_ke
         duplicate_key = id SUBSEP key_name
         if (object_seen[duplicate_key]) fail("duplicate object key")
         object_seen[duplicate_key] = 1
+        duplicate_key = id SUBSEP tolower(key_name)
+        if (object_seen_folded[duplicate_key]) fail("case-colliding object key")
+        object_seen_folded[duplicate_key] = 1
         skip_space()
         if (substr(document, position, 1) != ":") fail("expected colon after object key")
         position++
@@ -176,6 +260,7 @@ function parse_object(    id, key_node, key_name, child, character, duplicate_ke
         character = substr(document, position, 1)
         if (character == "}") {
             position++
+            parse_depth--
             return id
         }
         if (character != ",") fail("expected comma or closing brace")
@@ -258,6 +343,49 @@ function string_equals(id, value) {
 
 function literal_equals(id, value) {
     return (node_kind[id] == "literal" || node_kind[id] == "number") && node_value[id] == value
+}
+
+function utf8_length(value,    index_value, count, first) {
+    for (index_value = 1; index_value <= length(value); index_value++) {
+        first = byte_value(substr(value, index_value, 1))
+        count++
+        if (first >= 194 && first <= 223) index_value += 1
+        else if (first >= 224 && first <= 239) index_value += 2
+        else if (first >= 240 && first <= 244) index_value += 3
+    }
+    return count
+}
+
+function portable_name(value, maximum, allow_blank) {
+    if (value == "") return allow_blank
+    return utf8_length(value) <= maximum && value ~ /^[a-z0-9]+(-[a-z0-9]+)*$/
+}
+
+function validate_manifest(root,    index_value, name, id_node, display_node, prefix_node) {
+    if (node_size[root] != 6) fail("catalog manifest must have exactly six fields")
+    for (index_value = 1; index_value <= node_size[root]; index_value++) {
+        name = node_name[root SUBSEP index_value]
+        if (name != "$schema" && name != "schema_version" && name != "catalog_id" &&
+                name != "display_name" && name != "skills_directory" &&
+                name != "default_prefix") fail("unknown catalog manifest field")
+    }
+    if (!string_equals(object_value(root, "$schema"), "./schemas/catalog.schema.json") ||
+            !literal_equals(object_value(root, "schema_version"), "1") ||
+            !string_equals(object_value(root, "skills_directory"), "skills")) {
+        fail("unsupported catalog manifest contract")
+    }
+    id_node = object_value(root, "catalog_id")
+    display_node = object_value(root, "display_name")
+    prefix_node = object_value(root, "default_prefix")
+    if (node_kind[id_node] != "string" ||
+            !portable_name(decode_string(node_value[id_node]), 64, 0)) fail("invalid catalog id")
+    if (node_kind[display_node] != "string" ||
+            utf8_length(decode_string(node_value[display_node])) < 1 ||
+            utf8_length(decode_string(node_value[display_node])) > 128) fail("invalid display name")
+    if (node_kind[prefix_node] != "string" ||
+            !portable_name(decode_string(node_value[prefix_node]), 62, 1)) fail("invalid default prefix")
+    print decode_string(node_value[id_node])
+    print decode_string(node_value[prefix_node])
 }
 
 function owned_handler(id,    type_id, command_id, async_id) {
@@ -390,11 +518,19 @@ BEGIN {
 }
 
 {
+    incoming_length = length($0) + (NR == 1 ? 0 : 1)
+    if (length(document) + incoming_length > 1048576) {
+        print "json editor: JSON input exceeds 1 MiB" > "/dev/stderr"
+        input_failed = 1
+        exit 2
+    }
     document = document (NR == 1 ? "" : "\n") $0
 }
 
 END {
+    if (input_failed) exit 2
     if (document == "") document = "{}"
+    validate_utf8(document)
     position = 1
     root_node = parse_value()
     skip_space()
@@ -402,6 +538,10 @@ END {
     if (node_kind[root_node] != "object") fail("top-level JSON value must be an object")
 
     if (operation == "check") exit 0
+    if (operation == "manifest") {
+        validate_manifest(root_node)
+        exit 0
+    }
     if (operation != "add" && operation != "remove") fail("unsupported operation")
     if (product != "claude" && product != "codex" && product != "cursor") fail("unsupported product")
     if (command == "") command = ENVIRON["TEAM_SKILLS_JSON_COMMAND"]

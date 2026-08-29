@@ -20,6 +20,15 @@ class CreatorError(ValueError):
     """A safe, user-correctable creator failure."""
 
 
+def reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        value[key] = item
+    return value
+
+
 def find_catalog_root(start: Path) -> Path:
     current = start.resolve()
     for candidate in (current, *current.parents):
@@ -31,10 +40,13 @@ def find_catalog_root(start: Path) -> Path:
 def load_catalog(root: Path) -> dict[str, object]:
     manifest_path = root / "catalog.json"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_json_keys,
+        )
     except FileNotFoundError as exc:
         raise CreatorError(f"catalog manifest not found: {manifest_path}") from exc
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise CreatorError(f"cannot read catalog manifest {manifest_path}: {exc}") from exc
     if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
         raise CreatorError("the creator supports only catalog schema_version 1")

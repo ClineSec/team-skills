@@ -133,12 +133,24 @@ def effective_skill_name(prefix: str, skill_name: str) -> str:
     return effective
 
 
+def reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        value[key] = item
+    return value
+
+
 def validate_catalog(root: Path) -> tuple[list[str], int, str]:
     errors: list[str] = []
     manifest_path = root / "catalog.json"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_json_keys,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         return [f"{manifest_path}: cannot read valid UTF-8 JSON: {exc}"], 0, "unknown"
     if not isinstance(manifest, dict):
         return [f"{manifest_path}: top level must be an object"], 0, "unknown"

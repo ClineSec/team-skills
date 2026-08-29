@@ -141,6 +141,23 @@ class FoundationTests(unittest.TestCase):
             errors, _, _ = validator.validate_catalog(root)
             self.assertTrue(any("must match parent 'portable-name'" in error for error in errors))
 
+    def test_validator_and_creator_reject_duplicate_manifest_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_catalog(root)
+            manifest = root / "catalog.json"
+            source = manifest.read_text(encoding="utf-8")
+            source = source.replace(
+                '  "display_name": "Team Skills",',
+                '  "display_name": "first",\n  "\\u0064isplay_name": "Team Skills",',
+            )
+            manifest.write_text(source, encoding="utf-8")
+            errors, _, _ = validator.validate_catalog(root)
+            self.assertTrue(any("duplicate JSON object key" in error for error in errors))
+            created = self.run_creator(root)
+            self.assertEqual(created.returncode, 2)
+            self.assertIn("duplicate JSON object key", created.stderr)
+
     def test_validator_rejects_product_specific_frontmatter(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

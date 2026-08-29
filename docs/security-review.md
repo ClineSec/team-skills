@@ -43,10 +43,11 @@ paths; same-history mirror origins; concurrent session starts; foreign hook entr
 collisions; and dead well-formed locks after the stale interval.
 
 Rejected without mutation include relative, filesystem-root, non-normalized POSIX, symlinked or
-reparse-point override targets or catalog-owned state; malformed or unsupported JSON; duplicate
-owned entries; changed owned commands; linked canonical content; missing or malformed lifecycle
-files; invalid catalog identity or names; credential-bearing fetch failures; future throttle
-timestamps; unexpected lock contents; and non-fast-forward, downgrade, or unrelated history.
+reparse-point override targets or catalog-owned state; malformed, invalid-UTF-8, oversized, or
+excessively nested JSON; decoded duplicate or case-colliding object keys; duplicate owned entries;
+changed owned commands; linked canonical content; missing or malformed lifecycle files; invalid
+catalog identity or names; credential-bearing fetch failures; future throttle timestamps;
+unexpected lock contents; and non-fast-forward, downgrade, or unrelated history.
 
 ## Residual risks and ownership
 

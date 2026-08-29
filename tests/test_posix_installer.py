@@ -437,6 +437,42 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertIn("keeping the last known-good installation", failed.stderr)
         self.assertEqual(exposed.read_bytes(), original)
 
+    def test_malformed_json_manifest_cannot_advance_managed_clone(self) -> None:
+        work, origin = self.make_catalog("manifest-json", "# Known good manifest")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        managed = self.instance_root() / "repo"
+        previous = self.git("rev-parse", "HEAD", cwd=managed).stdout.strip()
+        manifest = work / "catalog.json"
+        malformed = manifest.read_text(encoding="utf-8").rstrip()
+        self.assertTrue(malformed.endswith("}"))
+        manifest.write_text(malformed[:-1].rstrip() + ",\n}\n", encoding="utf-8")
+        self.git("add", "catalog.json", cwd=work)
+        self.git("commit", "-m", "malformed JSON manifest", cwd=work)
+        self.git("push", cwd=work)
+
+        failed = self.run_installer("install", origin)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("fetched catalog is invalid", failed.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=managed).stdout.strip(), previous)
+        self.assertIn(
+            "# Known good manifest",
+            (self.agents / "common-skill" / "SKILL.md").read_text(),
+        )
+
+    def test_structurally_valid_minified_manifest_is_accepted(self) -> None:
+        work, origin = self.make_catalog("manifest-format", "# Flexible JSON")
+        manifest = work / "catalog.json"
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+        value["display_name"] = "Café catalog"
+        manifest.write_text(json.dumps(value, separators=(",", ":")) + "\n", encoding="utf-8")
+        self.git("add", "catalog.json", cwd=work)
+        self.git("commit", "-m", "minify valid manifest", cwd=work)
+        self.git("push", cwd=work)
+
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertIn("# Flexible JSON", (self.agents / "common-skill" / "SKILL.md").read_text())
+
     def test_non_fast_forward_origin_change_is_rejected_with_remove_reinstall_recovery(self) -> None:
         _, initial_origin = self.make_catalog("initial", "# Initial origin")
         _, replacement_origin = self.make_catalog("replacement", "# Replacement origin")

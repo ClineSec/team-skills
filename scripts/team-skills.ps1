@@ -145,6 +145,68 @@ function Read-Utf8Text([string]$Path) {
     return [System.IO.File]::ReadAllText($Path, $encoding)
 }
 
+function Test-SafeJsonText([string]$Text) {
+    if ($Text.Length -gt 1048576) { return $false }
+    $stack = [System.Collections.ArrayList]::new()
+    for ($index = 0; $index -lt $Text.Length; $index++) {
+        $character = $Text[$index]
+        if ($character -ceq '"') {
+            $start = $index
+            $closed = $false
+            for ($index++; $index -lt $Text.Length; $index++) {
+                if ($Text[$index] -ceq '\') {
+                    $index++
+                    continue
+                }
+                if ($Text[$index] -ceq '"') {
+                    $closed = $true
+                    break
+                }
+            }
+            if (-not $closed) { return $false }
+            $after = $index + 1
+            while ($after -lt $Text.Length -and $Text[$after] -match '[\x20\x09\x0a\x0d]') { $after++ }
+            if ($after -lt $Text.Length -and $Text[$after] -ceq ':') {
+                if ($stack.Count -eq 0 -or $stack[$stack.Count - 1].Kind -cne 'object') {
+                    return $false
+                }
+                $raw = $Text.Substring($start, $index - $start + 1)
+                try { $decoded = ConvertFrom-Json -InputObject $raw }
+                catch { return $false }
+                if ($decoded -isnot [string]) { return $false }
+                $context = $stack[$stack.Count - 1]
+                if (-not $context.Exact.Add($decoded) -or -not $context.Folded.Add($decoded)) {
+                    return $false
+                }
+            }
+            continue
+        }
+        if ($character -ceq '{' -or $character -ceq '[') {
+            if ($stack.Count -ge 64) { return $false }
+            if ($character -ceq '{') {
+                $context = [PSCustomObject]@{
+                    Kind = 'object'
+                    Exact = [System.Collections.Generic.HashSet[string]]::new(
+                        [System.StringComparer]::Ordinal
+                    )
+                    Folded = [System.Collections.Generic.HashSet[string]]::new(
+                        [System.StringComparer]::OrdinalIgnoreCase
+                    )
+                }
+            }
+            else {
+                $context = [PSCustomObject]@{ Kind = 'array'; Exact = $null; Folded = $null }
+            }
+            $null = $stack.Add($context)
+            continue
+        }
+        if ($character -ceq '}' -or $character -ceq ']') {
+            if ($stack.Count -gt 0) { $stack.RemoveAt($stack.Count - 1) }
+        }
+    }
+    return $true
+}
+
 function Get-ExactJsonProperty([object]$Object, [string]$Name) {
     if ($Object -isnot [System.Management.Automation.PSCustomObject]) { return $null }
     $matches = @($Object.PSObject.Properties | Where-Object { $_.Name -ceq $Name })
@@ -188,6 +250,9 @@ function Test-OwnedCursorHook([object]$Value, [string]$Command) {
 }
 
 function Edit-HookJson([string]$Text, [string]$Operation, [string]$Product, [string]$Command) {
+    if (-not (Test-SafeJsonText $Text)) {
+        Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+    }
     try {
         $root = $Text | ConvertFrom-Json
     }
@@ -345,8 +410,12 @@ function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigP
             )
         }
         catch { Fail "cannot preserve $Product hook configuration access protection" }
+        if ($item.Length -gt 1048576) {
+            Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+        }
         [System.IO.File]::WriteAllBytes($beforePath, [System.IO.File]::ReadAllBytes($ConfigPath))
-        $beforeText = Read-Utf8Text $beforePath
+        try { $beforeText = Read-Utf8Text $beforePath }
+        catch { Fail "$Product hook configuration is malformed, unsupported, or no longer owned" }
     }
     else {
         $beforeText = '{}' + [Environment]::NewLine
@@ -570,7 +639,10 @@ function Read-Catalog([string]$CatalogRoot) {
         return $null
     }
     try {
-        $manifest = (Read-Utf8Text $manifestPath) | ConvertFrom-Json
+        if ($manifestItem.Length -gt 1048576) { return $null }
+        $manifestText = Read-Utf8Text $manifestPath
+        if (-not (Test-SafeJsonText $manifestText)) { return $null }
+        $manifest = $manifestText | ConvertFrom-Json
     }
     catch { return $null }
     if ($null -eq $manifest -or $manifest -isnot [System.Management.Automation.PSCustomObject]) {

@@ -339,6 +339,43 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertFalse(self.codex_hooks.exists())
         self.assertFalse(self.cursor_hooks.exists())
 
+    def test_ambiguous_or_resource_exhausting_hook_json_is_refused_without_overwrite(self) -> None:
+        _, origin = self.make_catalog("adversarial-hooks", "# Hooks")
+        self.claude_hooks.parent.mkdir(parents=True)
+        attacks = (
+            b'{"foreign":1,"\\u0066oreign":2}',
+            b'{"foreign":1,"FOREIGN":2}',
+            ('{"a":' * 65 + '1' + '}' * 65).encode("utf-8"),
+            ('{"value":"' + ('a' * 1048576) + '"}').encode("utf-8"),
+        )
+        for attack in attacks:
+            with self.subTest(length=len(attack), prefix=attack[:32]):
+                self.claude_hooks.write_bytes(attack)
+                refused = self.run_installer("install", origin)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("malformed, unsupported", refused.stderr)
+                self.assertEqual(self.claude_hooks.read_bytes(), attack)
+                self.assertFalse(self.codex_hooks.exists())
+                self.assertFalse(self.cursor_hooks.exists())
+
+    def test_duplicate_manifest_key_is_rejected_before_bootstrap_install(self) -> None:
+        work, origin = self.make_catalog("duplicate-manifest", "# Manifest")
+        manifest = work / "catalog.json"
+        source = manifest.read_text(encoding="utf-8")
+        source = source.replace(
+            '  "display_name": "duplicate-manifest",',
+            '  "display_name": "first",\n  "\\u0064isplay_name": "duplicate-manifest",',
+        )
+        manifest.write_text(source, encoding="utf-8")
+        self.git("add", "catalog.json", cwd=work)
+        self.git("commit", "-m", "duplicate manifest key", cwd=work)
+        self.git("push", cwd=work)
+
+        refused = self.run_installer("install", origin)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("not a valid catalog", refused.stderr)
+        self.assertFalse((self.state / "catalogs").exists())
+
     def test_hook_command_handles_unicode_spaces_and_shell_metacharacters(self) -> None:
         self.state = self.base / "state root § & 'quoted'"
         self.env["TEAM_SKILLS_STATE_ROOT"] = str(self.state)

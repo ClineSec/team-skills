@@ -174,7 +174,7 @@ prepare_hook_edit() {
     else
         printf '{}\n' >"$hook_before"
     fi
-    if ! TEAM_SKILLS_JSON_COMMAND=$hook_command awk -v operation="$hook_operation" -v product="$hook_product" \
+    if ! TEAM_SKILLS_JSON_COMMAND=$hook_command LC_ALL=C awk -v operation="$hook_operation" -v product="$hook_product" \
         -f "$HOOK_EDITOR" "$hook_before" >"$hook_after"; then
         rm -f "$hook_after"
         die "$hook_product hook configuration is malformed, unsupported, or no longer owned"
@@ -648,12 +648,6 @@ valid_name() {
     printf '%s\n' "$value" | LC_ALL=C grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$'
 }
 
-json_string() {
-    json_file=$1
-    json_key=$2
-    sed -n "s/^[[:space:]]*\"$json_key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\"[[:space:]]*,\{0,1\}[[:space:]]*$/\1/p" "$json_file"
-}
-
 validate_skill() {
     skill_dir=$1
     expected_name=$2
@@ -690,21 +684,11 @@ validate_catalog() {
     validate_runtime "$catalog_root" || return 1
     manifest=$catalog_root/catalog.json
     [ -f "$manifest" ] && [ ! -L "$manifest" ] || return 1
-    keys=$WORK_ROOT/manifest-keys
-    expected=$WORK_ROOT/manifest-expected
-    sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*:.*/\1/p' "$manifest" | LC_ALL=C sort >"$keys"
-    printf '%s\n' '$schema' catalog_id default_prefix display_name schema_version skills_directory | LC_ALL=C sort >"$expected"
-    cmp -s "$keys" "$expected" || return 1
-    [ "$(json_string "$manifest" '\$schema')" = './schemas/catalog.schema.json' ] || return 1
-    [ "$(sed -n 's/^[[:space:]]*"schema_version"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*,\{0,1\}[[:space:]]*$/\1/p' "$manifest")" = 1 ] || return 1
-    CATALOG_ID=$(json_string "$manifest" catalog_id)
-    DISPLAY_NAME=$(json_string "$manifest" display_name)
-    DEFAULT_PREFIX=$(json_string "$manifest" default_prefix)
-    [ "$(json_string "$manifest" skills_directory)" = skills ] || return 1
-    valid_name "$CATALOG_ID" || return 1
-    [ -n "$DISPLAY_NAME" ] && [ ${#DISPLAY_NAME} -le 128 ] || return 1
-    if [ -n "$DEFAULT_PREFIX" ]; then valid_name "$DEFAULT_PREFIX" || return 1; fi
-    [ ${#DEFAULT_PREFIX} -le 62 ] || return 1
+    manifest_values=$WORK_ROOT/manifest-values
+    LC_ALL=C awk -v operation=manifest -f "$catalog_root/scripts/team-skills-json.awk" \
+        "$manifest" >"$manifest_values" 2>/dev/null || return 1
+    CATALOG_ID=$(sed -n '1p' "$manifest_values")
+    DEFAULT_PREFIX=$(sed -n '2p' "$manifest_values")
     skills_root=$catalog_root/skills
     [ -d "$skills_root" ] && [ ! -L "$skills_root" ] || return 1
     [ -z "$(find "$skills_root" -type l -print -quit)" ] || return 1

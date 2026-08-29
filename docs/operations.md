@@ -137,9 +137,12 @@ ownership record. Restore the expected owned entry or path from a trusted backup
 ### Installation refuses a hook file
 
 Team Skills accepts a JSON object with supported hook container shapes. It rejects malformed JSON,
-duplicate keys, wrong hook container types, symlinked configuration files, and owned entries that
-no longer exactly match. The original file is not overwritten and the installation transaction is
-rolled back. Correct or restore the file, preserve its unrelated fields, and rerun `install`.
+duplicate or case-colliding keys, invalid UTF-8, documents larger than 1 MiB, nesting beyond 64
+container levels, wrong hook container types, symlinked configuration files, and owned entries
+that no longer exactly match. Case-colliding keys are refused because Windows PowerShell cannot
+preserve both properties reliably. The original file is not overwritten and the installation
+transaction is rolled back. Correct or restore the file, preserve its unrelated fields, and rerun
+`install`.
 
 ### Fetch or candidate validation fails
 

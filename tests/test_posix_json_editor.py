@@ -39,6 +39,37 @@ class PosixJsonEditorTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
 
+    def test_check_rejects_decoded_duplicate_and_case_colliding_keys(self) -> None:
+        sources = (
+            '{"key": 1, "\\u006bey": 2}',
+            '{"é": 1, "\\u00e9": 2}',
+            '{"😀": 1, "\\ud83d\\ude00": 2}',
+            '{"key": 1, "KEY": 2}',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                result = self.edit(source, "check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_check_bounds_size_depth_and_rejects_malformed_utf8(self) -> None:
+        deep = '{"a":' * 65 + '1' + '}' * 65
+        self.assertNotEqual(self.edit(deep, "check").returncode, 0)
+        oversized = '{"value":"' + ('a' * 1048576) + '"}'
+        self.assertNotEqual(self.edit(oversized, "check").returncode, 0)
+
+        environment = os.environ.copy()
+        environment["LC_ALL"] = "C"
+        malformed_utf8 = subprocess.run(
+            ["awk", "-voperation=check", "-f", str(EDITOR)],
+            input=b'{"foreign":"\xed\xa0\x80"}\n',
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+        self.assertNotEqual(malformed_utf8.returncode, 0)
+        self.assertEqual(malformed_utf8.stdout, b"")
+
     def test_check_rejects_every_raw_json_control_byte(self) -> None:
         environment = os.environ.copy()
         for value in range(0x20):

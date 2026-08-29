@@ -21,7 +21,9 @@ must be ordinary in-repository paths, not symlinks, so a fork is self-contained.
 | `default_prefix` | Blank by default, or a kebab-case prefix without a trailing separator. |
 
 Unknown manifest fields fail validation in v1. Extensions require a schema-version change rather
-than being guessed by older operational code.
+than being guessed by older operational code. The lifecycle utilities accept ordinary JSON
+formatting and escapes, but reject invalid UTF-8, decoded duplicate or case-colliding keys,
+documents larger than 1 MiB, and nesting beyond 64 container levels before interpreting fields.
 
 ## Catalog instance identity
 
