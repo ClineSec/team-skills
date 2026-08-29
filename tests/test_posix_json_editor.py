@@ -18,6 +18,9 @@ class PosixJsonEditorTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["TEAM_SKILLS_JSON_COMMAND"] = command
+        # The lifecycle utility always fixes the byte-oriented parser locale so awk variants do
+        # not reinterpret UTF-8 bytes while canonicalizing escaped object keys.
+        environment["LC_ALL"] = "C"
         arguments = ["awk", f"-voperation={operation}"]
         if product:
             arguments.append(f"-vproduct={product}")
