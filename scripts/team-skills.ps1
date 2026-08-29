@@ -1,10 +1,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("install", "remove")]
+    [ValidateSet("install", "remove", "update-all", "hook", "update-instance", "update-prefix")]
     [string]$Action,
 
-    [Parameter(Mandatory = $true, Position = 1)]
+    [Parameter(Position = 1)]
+    [AllowEmptyString()]
     [string]$RepositoryUrl,
 
     [Parameter(Position = 2)]
@@ -15,8 +16,9 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
-# Team Skills milestone-2 lifecycle utility. Runtime dependencies: Windows PowerShell and Git.
+# Team Skills lifecycle utility. Runtime dependencies: Windows PowerShell and Git.
 $PrefixWasSupplied = $PSBoundParameters.ContainsKey("Prefix")
+$ScriptPath = [System.IO.Path]::GetFullPath($MyInvocation.MyCommand.Path)
 $WorkRoot = $null
 $CandidateWorktree = $null
 $ManagedRepo = $null
@@ -29,6 +31,7 @@ $script:OwnershipSnapshot = $null
 $script:HadPreviousGeneration = $false
 $script:PreviousGenerationTarget = $null
 $script:PreviousRepoHead = $null
+$script:UpdateDiagnostics = [System.Collections.Generic.List[string]]::new()
 
 function Fail([string]$Message) {
     throw [System.InvalidOperationException]::new($Message)
@@ -241,6 +244,285 @@ function Activate-Generation([string]$InstallRoot, [string]$GenerationPath) {
     Remove-DirectoryExposure $previous
 }
 
+function Test-InstanceKey([string]$Value) {
+    return -not [string]::IsNullOrEmpty($Value) -and $Value -cmatch '^[a-z0-9-]+$'
+}
+
+function Write-UpdateDiagnostic([string]$Message) {
+    if ($script:UpdateDiagnostics.Count -lt 256) {
+        $script:UpdateDiagnostics.Add($Message)
+    }
+    [Console]::Error.WriteLine($Message)
+}
+
+function Get-UpdateTimingValue([string]$Name, [long]$DefaultValue) {
+    $value = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrEmpty($value)) { return $DefaultValue }
+    $parsed = 0L
+    if ($value -cnotmatch '^[0-9]+$' -or
+            -not [long]::TryParse($value, [ref]$parsed)) {
+        Fail "update timing override is invalid"
+    }
+    return $parsed
+}
+
+function Test-ProcessActive([int]$ProcessId) {
+    try {
+        $null = Get-Process -Id $ProcessId -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Enter-CatalogUpdateLock([string]$InstanceRoot, [long]$Now, [long]$StaleSeconds) {
+    $lockRoot = Join-Path $InstanceRoot "update.lock"
+    try {
+        $null = New-Item -ItemType Directory -Path $lockRoot -ErrorAction Stop
+    }
+    catch [System.IO.IOException] {
+        if (-not (Test-PathEntry $lockRoot)) { return $null }
+        $lockItem = Get-Item -Force -LiteralPath $lockRoot
+        if (-not ($lockItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $lockItem)) {
+            Write-UpdateDiagnostic "warning: unsafe update lock path; skipping catalog"
+            return $null
+        }
+        $lockEntries = @(Get-ChildItem -Force -LiteralPath $lockRoot)
+        $ownerPath = Join-Path $lockRoot "owner"
+        if ($lockEntries.Count -ne 1 -or $lockEntries[0].Name -cne "owner" -or
+                -not ($lockEntries[0] -is [System.IO.FileInfo]) -or
+                (Test-ReparsePoint $lockEntries[0])) {
+            return $null
+        }
+        try {
+            $ownerLines = [System.IO.File]::ReadAllLines($ownerPath)
+        }
+        catch { return $null }
+        $ownerPid = 0
+        $ownerTime = 0L
+        if ($ownerLines.Count -ne 2 -or
+                -not [int]::TryParse($ownerLines[0], [ref]$ownerPid) -or $ownerPid -le 0 -or
+                -not [long]::TryParse($ownerLines[1], [ref]$ownerTime) -or $ownerTime -lt 0) {
+            return $null
+        }
+        if ((Test-ProcessActive $ownerPid) -or $Now -lt $ownerTime -or
+                ($Now - $ownerTime) -lt $StaleSeconds) {
+            return $null
+        }
+
+        $staleLock = Join-Path $InstanceRoot (".stale-lock." + [guid]::NewGuid().ToString("N"))
+        try {
+            Move-Item -LiteralPath $lockRoot -Destination $staleLock -ErrorAction Stop
+            try {
+                $null = New-Item -ItemType Directory -Path $lockRoot -ErrorAction Stop
+            }
+            catch {
+                if (-not (Test-PathEntry $lockRoot)) {
+                    Move-Item -LiteralPath $staleLock -Destination $lockRoot -ErrorAction SilentlyContinue
+                }
+                return $null
+            }
+            try {
+                Remove-Item -Recurse -Force -LiteralPath $staleLock -ErrorAction Stop
+            }
+            catch {
+                Remove-Item -Recurse -Force -LiteralPath $lockRoot -ErrorAction SilentlyContinue
+                if (-not (Test-PathEntry $lockRoot)) {
+                    Move-Item -LiteralPath $staleLock -Destination $lockRoot -ErrorAction SilentlyContinue
+                }
+                return $null
+            }
+        }
+        catch {
+            return $null
+        }
+    }
+
+    $ownerPath = Join-Path $lockRoot "owner"
+    try {
+        [System.IO.File]::WriteAllText(
+            $ownerPath,
+            ([System.Diagnostics.Process]::GetCurrentProcess().Id.ToString() +
+                [Environment]::NewLine + $Now.ToString() + [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+    catch {
+        Remove-Item -Recurse -Force -LiteralPath $lockRoot -ErrorAction SilentlyContinue
+        Fail "cannot record update lock ownership"
+    }
+    return $lockRoot
+}
+
+function Test-OwnedUpdateLock([string]$LockRoot, [long]$Now) {
+    try {
+        $lockItem = Get-Item -Force -LiteralPath $LockRoot
+        $ownerItem = Get-Item -Force -LiteralPath (Join-Path $LockRoot "owner")
+        if (-not ($lockItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $lockItem) -or
+                -not ($ownerItem -is [System.IO.FileInfo]) -or (Test-ReparsePoint $ownerItem)) {
+            return $false
+        }
+        $lines = [System.IO.File]::ReadAllLines($ownerItem.FullName)
+        return $lines.Count -eq 2 -and
+            $lines[0] -ceq ([System.Diagnostics.Process]::GetCurrentProcess().Id.ToString()) -and
+            $lines[1] -ceq $Now.ToString()
+    }
+    catch { return $false }
+}
+
+function Invoke-CatalogUpdate([string]$InstanceKey) {
+    if (-not (Test-InstanceKey $InstanceKey)) {
+        Write-UpdateDiagnostic "error: invalid catalog instance key"
+        return $false
+    }
+    $instanceRoot = Join-Path (Join-Path $StateRoot "catalogs") $InstanceKey
+    if (-not (Test-PathEntry $instanceRoot)) {
+        Write-UpdateDiagnostic "error: catalog instance state is invalid"
+        return $false
+    }
+    $instanceItem = Get-Item -Force -LiteralPath $instanceRoot
+    if (-not ($instanceItem -is [System.IO.DirectoryInfo]) -or
+            (Test-ReparsePoint $instanceItem) -or
+            -not (Test-PathEntry (Join-Path (Join-Path $instanceRoot "repo") ".git"))) {
+        Write-UpdateDiagnostic "error: catalog instance state is invalid"
+        return $false
+    }
+
+    try {
+        $now = Get-UpdateTimingValue "TEAM_SKILLS_NOW" ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+        $throttle = Get-UpdateTimingValue "TEAM_SKILLS_THROTTLE_SECONDS" 21600
+        $staleSeconds = Get-UpdateTimingValue "TEAM_SKILLS_STALE_LOCK_SECONDS" 3600
+        $lockRoot = Enter-CatalogUpdateLock $instanceRoot $now $staleSeconds
+    }
+    catch {
+        Write-UpdateDiagnostic ("error: " + $_.Exception.Message)
+        return $false
+    }
+    if ($null -eq $lockRoot) { return $true }
+
+    try {
+        $successStamp = Join-Path $instanceRoot "last-success"
+        if (Test-PathEntry $successStamp) {
+            $stampItem = Get-Item -Force -LiteralPath $successStamp
+            if ($stampItem -is [System.IO.FileInfo] -and -not (Test-ReparsePoint $stampItem)) {
+                $lastSuccess = 0L
+                $stampValue = ([System.IO.File]::ReadAllText($successStamp)).Trim()
+                if ([long]::TryParse($stampValue, [ref]$lastSuccess) -and
+                        $lastSuccess -ge 0 -and $now -ge $lastSuccess -and
+                        ($now - $lastSuccess) -lt $throttle) {
+                    return $true
+                }
+            }
+        }
+
+        $installsRoot = Join-Path $instanceRoot "installs"
+        if (-not (Test-PathEntry $installsRoot)) {
+            Write-UpdateDiagnostic "error: catalog installation state is invalid"
+            return $false
+        }
+        $installsItem = Get-Item -Force -LiteralPath $installsRoot
+        if (-not ($installsItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $installsItem)) {
+            Write-UpdateDiagnostic "error: catalog installation state is invalid"
+            return $false
+        }
+
+        $installedViews = @(Get-ChildItem -Force -LiteralPath $installsRoot | Where-Object {
+            $_ -is [System.IO.DirectoryInfo] -and -not (Test-ReparsePoint $_)
+        })
+        if ($installedViews.Count -eq 0) {
+            Write-UpdateDiagnostic "error: catalog installation state is invalid"
+            return $false
+        }
+
+        $updateFailed = $false
+        $powerShellExecutable = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $env:GIT_TERMINAL_PROMPT = "0"
+        foreach ($installedView in $installedViews) {
+            $installedKey = $installedView.Name
+            if ($installedKey -cne "_default" -and -not (Test-PortableName $installedKey 62)) {
+                Write-UpdateDiagnostic "warning: invalid installed prefix state; skipping catalog"
+                $updateFailed = $true
+                continue
+            }
+            $childOutput = @(& $powerShellExecutable -NoLogo -NoProfile -NonInteractive `
+                -ExecutionPolicy Bypass -File $ScriptPath update-prefix $InstanceKey $installedKey 2>&1)
+            $childExitCode = $LASTEXITCODE
+            foreach ($childLine in $childOutput) {
+                Write-UpdateDiagnostic $childLine.ToString()
+            }
+            if ($childExitCode -ne 0) { $updateFailed = $true }
+        }
+        if ($updateFailed) { return $false }
+
+        $stampTemp = Join-Path $instanceRoot (".last-success." + [guid]::NewGuid().ToString("N"))
+        [System.IO.File]::WriteAllText(
+            $stampTemp, $now.ToString() + [Environment]::NewLine,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -Force -LiteralPath $stampTemp -Destination $successStamp
+        return $true
+    }
+    catch {
+        Write-UpdateDiagnostic "error: catalog update failed safely"
+        return $false
+    }
+    finally {
+        if ((Test-PathEntry $lockRoot) -and (Test-OwnedUpdateLock $lockRoot $now)) {
+            Remove-Item -Recurse -Force -LiteralPath $lockRoot -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Write-AtomicBoundedLog([string]$Path, [string]$Text) {
+    if ($Text.Length -gt 65536) { $Text = $Text.Substring($Text.Length - 65536) }
+    $parent = [System.IO.Path]::GetDirectoryName($Path)
+    $null = New-Item -ItemType Directory -Force -Path $parent
+    $temporary = Join-Path $parent (".last-update." + [guid]::NewGuid().ToString("N"))
+    [System.IO.File]::WriteAllText($temporary, $Text, [System.Text.UTF8Encoding]::new($false))
+    Move-Item -Force -LiteralPath $temporary -Destination $Path
+}
+
+function Invoke-HookLaunch([string]$InstanceKey) {
+    if (-not (Test-InstanceKey $InstanceKey)) { return }
+    $instanceRoot = Join-Path (Join-Path $StateRoot "catalogs") $InstanceKey
+    if (-not (Test-PathEntry $instanceRoot)) { return }
+    $instanceItem = Get-Item -Force -LiteralPath $instanceRoot
+    if (-not ($instanceItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $instanceItem)) {
+        return
+    }
+    $logPath = Join-Path $instanceRoot "last-update.log"
+
+    if ($env:TEAM_SKILLS_TEST_FOREGROUND -ceq "1") {
+        try {
+            $script:UpdateDiagnostics.Clear()
+            $null = Invoke-CatalogUpdate $InstanceKey
+            $text = ($script:UpdateDiagnostics -join [Environment]::NewLine)
+            if ($text.Length -gt 0) { $text += [Environment]::NewLine }
+            Write-AtomicBoundedLog $logPath $text
+        }
+        catch { }
+        return
+    }
+
+    try {
+        $escapedScript = $ScriptPath.Replace("'", "''")
+        $escapedKey = $InstanceKey.Replace("'", "''")
+        $command = @"
+`$env:TEAM_SKILLS_INTERNAL_HOOK_LOG = '1'
+& '$escapedScript' update-instance '$escapedKey'
+"@
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
+        $start = [System.Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $start.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + $encoded
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $null = [System.Diagnostics.Process]::Start($start)
+    }
+    catch { }
+}
+
 function Invoke-TransactionRollback {
     if (-not $script:TransactionActive) { return }
     $script:TransactionActive = $false
@@ -315,7 +597,8 @@ function Invoke-TransactionRollback {
 }
 
 try {
-    if ([string]::IsNullOrWhiteSpace($RepositoryUrl)) {
+    if (($Action -ceq "install" -or $Action -ceq "remove") -and
+            [string]::IsNullOrWhiteSpace($RepositoryUrl)) {
         Fail "repository URL must not be blank"
     }
     if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
@@ -333,15 +616,97 @@ try {
     $AgentsRoot = Get-FullSafeRoot $agentsValue "TEAM_SKILLS_AGENTS_ROOT"
     $ClaudeRoot = Get-FullSafeRoot $claudeValue "TEAM_SKILLS_CLAUDE_ROOT"
 
+    if ($Action -ceq "hook") {
+        Invoke-HookLaunch $RepositoryUrl
+        [Environment]::ExitCode = 0
+        return
+    }
+    if ($Action -ceq "update-instance") {
+        $script:UpdateDiagnostics.Clear()
+        $updated = Invoke-CatalogUpdate $RepositoryUrl
+        if ($env:TEAM_SKILLS_INTERNAL_HOOK_LOG -ceq "1" -and
+                (Test-InstanceKey $RepositoryUrl)) {
+            $hookInstanceRoot = Join-Path (Join-Path $StateRoot "catalogs") $RepositoryUrl
+            if (Test-PathEntry $hookInstanceRoot) {
+                $hookLogText = ($script:UpdateDiagnostics -join [Environment]::NewLine)
+                if ($hookLogText.Length -gt 0) { $hookLogText += [Environment]::NewLine }
+                try {
+                    Write-AtomicBoundedLog (Join-Path $hookInstanceRoot "last-update.log") $hookLogText
+                }
+                catch { }
+            }
+        }
+        [Environment]::ExitCode = if ($updated) { 0 } else { 1 }
+        return
+    }
+    if ($Action -ceq "update-all") {
+        $catalogsRoot = Join-Path $StateRoot "catalogs"
+        if (-not (Test-PathEntry $catalogsRoot)) {
+            [Environment]::ExitCode = 0
+            return
+        }
+        $catalogsItem = Get-Item -Force -LiteralPath $catalogsRoot
+        if (-not ($catalogsItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $catalogsItem)) {
+            [Console]::Error.WriteLine("error: catalog state root is invalid")
+            [Environment]::ExitCode = 1
+            return
+        }
+        $overallSuccess = $true
+        foreach ($catalog in @(Get-ChildItem -Force -LiteralPath $catalogsRoot)) {
+            if (-not ($catalog -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $catalog)) {
+                continue
+            }
+            if (-not (Invoke-CatalogUpdate $catalog.Name)) { $overallSuccess = $false }
+        }
+        [Environment]::ExitCode = if ($overallSuccess) { 0 } else { 1 }
+        return
+    }
+    if ($Action -ceq "update-prefix" -and
+            ([string]::IsNullOrWhiteSpace($RepositoryUrl) -or -not $PrefixWasSupplied)) {
+        Fail "update-prefix requires a catalog instance and installed prefix key"
+    }
+
     $null = New-Item -ItemType Directory -Force -Path $StateRoot
     $WorkRoot = Join-Path $StateRoot (".operation." + [guid]::NewGuid().ToString("N"))
     $null = New-Item -ItemType Directory -Path $WorkRoot
 
-    $suppliedDigest = Get-Sha256 $RepositoryUrl
     $originIndexRoot = Join-Path $StateRoot "origins"
-    $originIndex = Join-Path $originIndexRoot ($suppliedDigest + ".instance")
     $existingInstance = $false
-    if (Test-PathEntry $originIndex) {
+    if ($Action -ceq "update-prefix") {
+        $instanceKey = $RepositoryUrl
+        if (-not (Test-InstanceKey $instanceKey)) { Fail "invalid catalog instance key" }
+        $instanceRoot = Join-Path (Join-Path $StateRoot "catalogs") $instanceKey
+        $instanceItem = Get-Item -Force -LiteralPath $instanceRoot
+        if (-not ($instanceItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $instanceItem)) {
+            Fail "catalog instance state is invalid"
+        }
+        $ManagedRepo = Join-Path $instanceRoot "repo"
+        if (-not (Test-PathEntry (Join-Path $ManagedRepo ".git"))) {
+            Fail "catalog instance has no managed clone"
+        }
+        $manifest = Read-Catalog $ManagedRepo
+        if ($null -eq $manifest) {
+            Fail "managed catalog clone is invalid; keeping the last known-good installation"
+        }
+        $configuredOrigin = Get-GitValue @('-C', $ManagedRepo, 'remote', 'get-url', 'origin') "managed clone has no configured origin"
+        if ([string]::IsNullOrEmpty($configuredOrigin)) { Fail "managed clone origin must not be blank" }
+        $instanceCatalogId = $manifest.catalog_id
+        $existingInstance = $true
+        $installKey = $Prefix
+        if ($installKey -ceq "_default") {
+            $Prefix = ""
+        }
+        elseif (-not (Test-PortableName $installKey 62)) {
+            Fail "installed prefix state is invalid"
+        }
+        $installRoot = Join-Path (Join-Path $instanceRoot "installs") $installKey
+        if (-not (Test-PathEntry $installRoot)) { Fail "installed prefix state is missing" }
+    }
+    else {
+        $suppliedDigest = Get-Sha256 $RepositoryUrl
+        $originIndex = Join-Path $originIndexRoot ($suppliedDigest + ".instance")
+    }
+    if ($Action -cne "update-prefix" -and (Test-PathEntry $originIndex)) {
         $indexItem = Get-Item -Force -LiteralPath $originIndex
         if (-not ($indexItem -is [System.IO.FileInfo]) -or (Test-ReparsePoint $indexItem)) {
             Fail "catalog origin index is invalid"
@@ -368,7 +733,7 @@ try {
         $instanceCatalogId = $manifest.catalog_id
         $existingInstance = $true
     }
-    else {
+    elseif ($Action -cne "update-prefix") {
         $bootstrapClone = Join-Path $WorkRoot "bootstrap"
         $captured = ""
         if ((Invoke-Git @('clone', '--quiet', '--no-local', '--', $RepositoryUrl, $bootstrapClone) ([ref]$captured)) -ne 0) {
@@ -387,7 +752,9 @@ try {
 
     if (-not $PrefixWasSupplied) { $Prefix = $manifest.default_prefix }
     if ($Prefix.Length -gt 0 -and -not (Test-PortableName $Prefix 62)) { Fail "invalid prefix" }
-    $installKey = if ($Prefix.Length -gt 0) { $Prefix } else { "_default" }
+    if ($Action -cne "update-prefix") {
+        $installKey = if ($Prefix.Length -gt 0) { $Prefix } else { "_default" }
+    }
     $installRoot = Join-Path (Join-Path $instanceRoot "installs") $installKey
 
     if ($Action -ceq "remove") {

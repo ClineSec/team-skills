@@ -103,6 +103,28 @@ class PowerShellInstallerTests(unittest.TestCase):
             env=self.env,
         )
 
+    def run_updater(self, action: str = "update-all", *extra: str) -> subprocess.CompletedProcess[str]:
+        assert POWERSHELL
+        return subprocess.run(
+            [
+                POWERSHELL,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(INSTALLER),
+                action,
+                *extra,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=self.env,
+            timeout=30,
+        )
+
     def remove_junction(self, path: Path) -> None:
         # os.rmdir maps to RemoveDirectoryW and removes the junction, not its target.
         os.rmdir(path)
@@ -279,6 +301,88 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertFalse((self.agents / "common-skill").exists())
         self.assertFalse((self.claude / "zz-race-skill").exists())
+
+    def test_url_free_update_reconciles_all_prefixes_from_changed_origin(self) -> None:
+        work, initial_origin = self.make_catalog("all-prefixes", "# Initial")
+        _, replacement_origin = self.make_catalog("replacement", "# Replacement")
+        self.assertEqual(self.run_installer("install", initial_origin).returncode, 0)
+        self.assertEqual(
+            self.run_installer("install", initial_origin, "-Prefix", "fork").returncode, 0
+        )
+
+        instance = next((self.state / "catalogs").iterdir())
+        self.git("remote", "set-url", "origin", str(replacement_origin), cwd=instance / "repo")
+        self.env.update({"TEAM_SKILLS_NOW": "2000000000", "TEAM_SKILLS_THROTTLE_SECONDS": "0"})
+        updated = self.run_updater()
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertIn("# Replacement", (self.agents / "common-skill" / "SKILL.md").read_text())
+        self.assertIn(
+            "# Replacement", (self.claude / "fork-common-skill" / "SKILL.md").read_text()
+        )
+        self.assertEqual((instance / "last-success").read_text().strip(), "2000000000")
+
+        # The updater discovers owned state and does not need the bootstrap worktree or URL.
+        shutil.rmtree(work)
+        retried = self.run_updater()
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+
+    def test_throttle_active_lock_and_stale_lock_recovery(self) -> None:
+        _, origin = self.make_catalog("locking", "# Initial")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = next((self.state / "catalogs").iterdir())
+        managed_repo = instance / "repo"
+        self.git("remote", "set-url", "origin", str(self.base / "missing origin"), cwd=managed_repo)
+
+        (instance / "last-success").write_text("2000000000\n", encoding="utf-8")
+        self.env.update({"TEAM_SKILLS_NOW": "2000000010", "TEAM_SKILLS_THROTTLE_SECONDS": "100"})
+        throttled = self.run_updater()
+        self.assertEqual(throttled.returncode, 0, throttled.stderr)
+
+        (instance / "last-success").unlink()
+        lock = instance / "update.lock"
+        lock.mkdir()
+        (lock / "owner").write_text(f"{os.getpid()}\n2000000000\n", encoding="utf-8")
+        locked = self.run_updater()
+        self.assertEqual(locked.returncode, 0, locked.stderr)
+        self.assertTrue(lock.is_dir())
+
+        shutil.rmtree(lock)
+        self.git("remote", "set-url", "origin", str(origin), cwd=managed_repo)
+        lock.mkdir()
+        (lock / "owner").write_text("2147483000\n100\n", encoding="utf-8")
+        self.env.update(
+            {
+                "TEAM_SKILLS_NOW": "2000000010",
+                "TEAM_SKILLS_THROTTLE_SECONDS": "0",
+                "TEAM_SKILLS_STALE_LOCK_SECONDS": "100",
+            }
+        )
+        recovered = self.run_updater()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_hook_masks_fetch_failure_and_writes_credential_safe_log(self) -> None:
+        _, origin = self.make_catalog("hook-failure", "# Known good")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = next((self.state / "catalogs").iterdir())
+        secret_origin = "file://fixture-user:fixture-password@/definitely/missing/catalog.git"
+        self.git("remote", "set-url", "origin", secret_origin, cwd=instance / "repo")
+        original = (self.agents / "common-skill" / "SKILL.md").read_bytes()
+        self.env.update(
+            {
+                "TEAM_SKILLS_TEST_FOREGROUND": "1",
+                "TEAM_SKILLS_NOW": "2000000000",
+                "TEAM_SKILLS_THROTTLE_SECONDS": "0",
+            }
+        )
+
+        hooked = self.run_updater("hook", instance.name)
+        self.assertEqual(hooked.returncode, 0, hooked.stderr)
+        log = (instance / "last-update.log").read_text(encoding="utf-8")
+        self.assertIn("unable to fetch the managed catalog origin", log)
+        self.assertNotIn("fixture-user", log)
+        self.assertNotIn("fixture-password", log)
+        self.assertEqual((self.agents / "common-skill" / "SKILL.md").read_bytes(), original)
 
 
 if __name__ == "__main__":
