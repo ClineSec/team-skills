@@ -204,12 +204,18 @@ class IntegratedMvpProof(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         repeated = self.install(first_origin)
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
-        first_bytes = (self.agents / "common-skill" / "SKILL.md").read_bytes()
+        first_bytes = {
+            root: (root / "common-skill" / "SKILL.md").read_bytes()
+            for root in (self.agents, self.claude)
+        }
 
         collision = self.install(second_origin)
         self.assertEqual(collision.returncode, 0, collision.stderr)
         self.assertIn("warning: catalog same-catalog-id skill common-skill skipped", collision.stderr)
-        self.assertEqual((self.agents / "common-skill" / "SKILL.md").read_bytes(), first_bytes)
+        for root in (self.agents, self.claude):
+            self.assertEqual(
+                (root / "common-skill" / "SKILL.md").read_bytes(), first_bytes[root]
+            )
 
         prefixed = self.install(second_origin, "second")
         self.assertEqual(prefixed.returncode, 0, prefixed.stderr)

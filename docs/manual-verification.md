@@ -52,6 +52,20 @@ and pushes one valid local commit. `origin ... unreachable` uses only an absent 
 with inert `manual-user` and `manual-secret` strings, so it exercises credential redaction without
 network access; `restore` puts back the original local origin.
 
+In the product checklists, “advance with `MARKER`” means exactly one of:
+
+```sh
+python3 scripts/prepare-manual-verification.py advance "$TEAM_SKILLS_MANUAL_ROOT" first MARKER
+```
+
+```powershell
+python scripts/prepare-manual-verification.py advance $TeamSkillsManualRoot first MARKER
+```
+
+Likewise, “set the origin `MODE`” means `origin "$TEAM_SKILLS_MANUAL_ROOT" first MODE` on
+POSIX or `origin $TeamSkillsManualRoot first MODE` on Windows, using the same helper command shown
+above. Replace `MARKER` and `MODE` only with the literal value named in the checklist.
+
 Claude Code, Codex, and Cursor must be launched from the prepared environment in the dedicated
 account/VM/profile so their ordinary paths resolve to the fixture's `home`. Merely redirecting the
 installer while launching a normal product profile would not test the generated hook files.
@@ -93,14 +107,14 @@ do not carry that setting outside this disposable profile.
 
 ### Claude Code
 
-1. Run `advance ... first claude-startup`, start a fresh local session, and confirm startup is
+1. Advance with `claude-startup`, start a fresh local session, and confirm startup is
    prompt and `last-success` eventually changes.
-2. Run `advance ... first claude-clear`, use `/clear`, and confirm another completed update.
+2. Advance with `claude-clear`, use `/clear`, and confirm another completed update.
 3. Record `last-success` and `last-update.log`, resume a session, and trigger compaction separately.
    Confirm neither file changes.
-4. Run `origin ... first unreachable`, start a fresh session, and confirm Claude Code remains
+4. Set the origin `unreachable`, start a fresh session, and confirm Claude Code remains
    usable, the previous skill stays active, and `last-update.log` contains neither `manual-user` nor
-   `manual-secret`. Run `origin ... first restore`, advance once more, and confirm a clean retry.
+   `manual-secret`. Set the origin `restore`, advance with `claude-retry`, and confirm a clean retry.
 
 Do not require the changed skill in the session that triggered the update. Claude Code normally
 scans skills before an asynchronous `SessionStart` update completes, so verify it in the following
@@ -111,25 +125,26 @@ session.
 1. Review the newly discovered non-managed Team Skills hook and explicitly trust its exact
    definition. Record that step; Codex skips it until trusted and requires renewed review if its
    hash changes.
-2. Advance the first origin, start a new local session, then advance again and use `/clear`.
+2. Advance with `codex-startup`, start a new local session, then advance with `codex-clear` and use `/clear`.
    Confirm both eventually update without delaying startup.
 3. Capture timestamps, resume and compact separately, and confirm neither starts an update.
-4. Repeat `origin ... unreachable`, fresh startup, `restore`, advance, and fresh startup. Confirm
-   fail-open behavior, last-known-good retention, a log without either inert credential string,
-   and clean retry.
+4. Set the origin `unreachable` and start fresh. Then set it to `restore`, advance with
+   `codex-retry`, and start fresh again. Confirm fail-open behavior, last-known-good retention, a
+   log without either inert credential string, and clean retry.
 
 As with Claude Code, allow one additional session before expecting a newly updated skill in the
 initial scan.
 
 ### Cursor
 
-1. Advance the first origin, create a new local composer/agent conversation, and confirm
+1. Advance with `cursor-conversation`, create a new local composer/agent conversation, and confirm
    `sessionStart` launches the updater without blocking conversation creation.
 2. Capture timestamps, open or change a workspace without creating a conversation, and confirm
    neither updater evidence file changes; Team Skills does not register `workspaceOpen`.
-3. Advance again, create a conversation, allow the fire-and-forget process to finish, and verify
-   the marker no later than the following conversation.
-4. Repeat the unreachable-origin, new-conversation, restore, advance, and clean-retry check.
+3. Advance with `cursor-following`, create a conversation, allow the fire-and-forget process to
+   finish, and verify the marker no later than the following conversation.
+4. Set the origin `unreachable` and create a conversation. Then set it to `restore`, advance with
+   `cursor-retry`, and create another conversation to confirm clean retry.
 
 This check applies only to local Cursor. User-level `~/.cursor/hooks.json` and `sessionStart` are
 not available in Cursor cloud agents, and no cloud synchronization is part of Team Skills.
@@ -149,6 +164,23 @@ sanitized evidence that must be retained. Confirm `fixture.json` reports the exa
 Then delete only `$TEAM_SKILLS_MANUAL_PARENT` on POSIX or `$TeamSkillsManualParent` on Windows. Do
 not delete a normal home, product configuration directory, or any parent of the generated fixture.
 No service, scheduled task, cron entry, plugin, wrapper, or machine-wide artifact was installed.
+
+After visually confirming the printed variable is the dedicated temporary parent created above,
+the scoped cleanup commands are:
+
+```sh
+test -f "$TEAM_SKILLS_MANUAL_ROOT/fixture.json"
+printf 'Deleting disposable fixture only: %s\n' "$TEAM_SKILLS_MANUAL_PARENT"
+rm -rf -- "$TEAM_SKILLS_MANUAL_PARENT"
+unset TEAM_SKILLS_MANUAL_PARENT TEAM_SKILLS_MANUAL_ROOT
+```
+
+```powershell
+if (-not (Test-Path -LiteralPath (Join-Path $TeamSkillsManualRoot "fixture.json"))) { throw "Fixture marker missing" }
+Write-Host "Deleting disposable fixture only: $TeamSkillsManualParent"
+Remove-Item -LiteralPath $TeamSkillsManualParent -Recurse -Force
+Remove-Variable TeamSkillsManualParent, TeamSkillsManualRoot
+```
 
 Record product versions, OS and shell versions, the tested Team Skills commit, sanitized
 before/after JSON, state timestamps, and any product warnings. Every row remains `PENDING` until a
