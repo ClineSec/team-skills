@@ -276,9 +276,14 @@ try {
             Fail "managed catalog clone is invalid; keeping the last known-good installation"
         }
         $configuredOrigin = Get-GitValue @('-C', $ManagedRepo, 'remote', 'get-url', 'origin') "managed clone has no configured origin"
-        $originDigest = Get-Sha256 $configuredOrigin
-        if ($originDigest -cne $suppliedDigest) { Fail "managed clone origin no longer matches this catalog instance" }
-        if ($instanceKey -cne ($manifest.catalog_id + '-' + $originDigest)) { Fail "catalog origin index identity mismatch" }
+        if ([string]::IsNullOrEmpty($configuredOrigin)) { Fail "managed clone origin must not be blank" }
+        $instancePrefix = $manifest.catalog_id + '-'
+        if (-not $instanceKey.StartsWith($instancePrefix, [System.StringComparison]::Ordinal)) {
+            Fail "catalog origin index identity mismatch"
+        }
+        $instanceDigest = $instanceKey.Substring($instancePrefix.Length)
+        if ($instanceDigest -cnotmatch '^[0-9a-f]{64}$') { Fail "catalog origin index identity mismatch" }
+        $instanceCatalogId = $manifest.catalog_id
         $existingInstance = $true
     }
     else {
@@ -293,6 +298,7 @@ try {
         if ([string]::IsNullOrEmpty($configuredOrigin)) { Fail "clone origin must not be blank" }
         $originDigest = Get-Sha256 $configuredOrigin
         $instanceKey = $manifest.catalog_id + '-' + $originDigest
+        $instanceCatalogId = $manifest.catalog_id
         $instanceRoot = Join-Path (Join-Path $StateRoot "catalogs") $instanceKey
         $ManagedRepo = Join-Path $instanceRoot "repo"
     }
@@ -363,7 +369,7 @@ try {
 
     $manifest = Read-Catalog $sourceRoot
     if ($null -eq $manifest) { Fail "catalog is invalid; keeping the last known-good installation" }
-    if ($instanceKey -cne ($manifest.catalog_id + '-' + $originDigest)) {
+    if ($manifest.catalog_id -cne $instanceCatalogId) {
         Fail "fetched catalog identity changed; keeping the last known-good installation"
     }
     if (-not $PrefixWasSupplied) { $Prefix = $manifest.default_prefix }

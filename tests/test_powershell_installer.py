@@ -176,6 +176,28 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertNotIn("fixture-password", combined)
         self.assertIn("unable to clone the supplied repository", combined)
 
+    def test_configured_origin_can_change_without_changing_instance_ownership(self) -> None:
+        _, initial_origin = self.make_catalog("initial", "# Initial origin")
+        _, replacement_origin = self.make_catalog("replacement", "# Replacement origin")
+        installed = self.run_installer("install", initial_origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        instance_roots = list((self.state / "catalogs").iterdir())
+        self.assertEqual(len(instance_roots), 1)
+        managed_repo = instance_roots[0] / "repo"
+        self.git("remote", "set-url", "origin", str(replacement_origin), cwd=managed_repo)
+
+        reconciled = self.run_installer("install", initial_origin)
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertIn(
+            "# Replacement origin", (self.agents / "common-skill" / "SKILL.md").read_text()
+        )
+        self.assertEqual(list((self.state / "catalogs").iterdir()), instance_roots)
+
+        removed = self.run_installer("remove", initial_origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(self.agents.joinpath("common-skill").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

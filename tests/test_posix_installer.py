@@ -107,6 +107,22 @@ class PosixInstallerTests(unittest.TestCase):
         repeated = self.run_installer("install", first_origin)
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertEqual(len(list((self.state / "catalogs").iterdir())), 1)
+        generations = (
+            next((self.state / "catalogs").iterdir())
+            / "installs"
+            / "_default"
+            / "generations"
+        )
+        generation = next(generations.iterdir())
+        self.assertEqual(
+            sorted(path.relative_to(generation) for path in generation.rglob("*")),
+            [
+                Path("common-skill"),
+                Path("common-skill/SKILL.md"),
+                Path("common-skill/scripts"),
+                Path("common-skill/scripts/helper.sh"),
+            ],
+        )
 
         collision = self.run_installer("install", second_origin)
         self.assertEqual(collision.returncode, 0, collision.stderr)
@@ -161,6 +177,68 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertIn("keeping the last known-good installation", failed.stderr)
         self.assertEqual(exposed.read_bytes(), original)
 
+    def test_configured_origin_can_change_without_changing_instance_ownership(self) -> None:
+        _, initial_origin = self.make_catalog("initial", "# Initial origin")
+        _, replacement_origin = self.make_catalog("replacement", "# Replacement origin")
+        installed = self.run_installer("install", initial_origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        instance_roots = list((self.state / "catalogs").iterdir())
+        self.assertEqual(len(instance_roots), 1)
+        managed_repo = instance_roots[0] / "repo"
+        self.git("remote", "set-url", "origin", str(replacement_origin), cwd=managed_repo)
+
+        reconciled = self.run_installer("install", initial_origin)
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertIn(
+            "# Replacement origin", (self.agents / "common-skill" / "SKILL.md").read_text()
+        )
+        self.assertEqual(list((self.state / "catalogs").iterdir()), instance_roots)
+
+        removed = self.run_installer("remove", initial_origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(self.agents.joinpath("common-skill").exists())
+
+    def test_failed_current_replacement_retains_last_known_good_view(self) -> None:
+        work, origin = self.make_catalog("replacement", "# Known good")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        exposed = self.agents / "common-skill" / "SKILL.md"
+        original = exposed.read_bytes()
+
+        skill_file = work / "skills" / "common-skill" / "SKILL.md"
+        skill_file.write_text(
+            skill_file.read_text(encoding="utf-8").replace("# Known good", "# Candidate"),
+            encoding="utf-8",
+        )
+        self.git("add", ".", cwd=work)
+        self.git("commit", "-m", "valid candidate", cwd=work)
+        self.git("push", cwd=work)
+
+        command_bin = self.base / "injected command bin"
+        command_bin.mkdir()
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        mv_wrapper = command_bin / "mv"
+        mv_wrapper.write_text(
+            "#!/bin/sh\n"
+            "last=\n"
+            "for argument do last=$argument; done\n"
+            "case $last in */current) exit 73 ;; esac\n"
+            'exec "$TEAM_SKILLS_TEST_REAL_MV" "$@"\n',
+            encoding="utf-8",
+        )
+        mv_wrapper.chmod(0o755)
+        self.env["TEAM_SKILLS_TEST_REAL_MV"] = real_mv or ""
+        self.env["PATH"] = str(command_bin) + os.pathsep + self.env["PATH"]
+
+        failed = self.run_installer("install", origin)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("cannot activate generated view", failed.stderr)
+        self.assertEqual(exposed.read_bytes(), original)
+        install_root = next((self.state / "catalogs").iterdir()) / "installs" / "_default"
+        self.assertEqual(list(install_root.glob(".current.*")), [])
+
     def test_clone_failure_does_not_print_credentials(self) -> None:
         secret_url = "file://fixture-user:fixture-password@/definitely/missing/catalog.git"
         result = self.run_installer("install", secret_url)
@@ -169,6 +247,22 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertNotIn("fixture-user", combined)
         self.assertNotIn("fixture-password", combined)
         self.assertIn("unable to clone the supplied repository", combined)
+
+    def test_script_accepts_curl_style_standard_input_bootstrap(self) -> None:
+        _, origin = self.make_catalog("stdin", "# Standard input bootstrap")
+        result = subprocess.run(
+            ["sh", "-s", "--", "install", str(origin)],
+            input=INSTALLER.read_text(encoding="utf-8"),
+            text=True,
+            capture_output=True,
+            check=False,
+            env=self.env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "# Standard input bootstrap",
+            (self.agents / "common-skill" / "SKILL.md").read_text(),
+        )
 
     def test_invalid_root_fails_before_clone_or_mutation(self) -> None:
         self.env["TEAM_SKILLS_STATE_ROOT"] = "relative/state"

@@ -80,6 +80,9 @@ cleanup() {
     if [ -n "${CANDIDATE_WORKTREE:-}" ] && [ -n "${MANAGED_REPO:-}" ]; then
         git -C "$MANAGED_REPO" worktree remove --force "$CANDIDATE_WORKTREE" >/dev/null 2>&1 || :
     fi
+    if [ -n "${NEXT_LINK:-}" ] && [ -L "$NEXT_LINK" ]; then
+        rm "$NEXT_LINK" >/dev/null 2>&1 || :
+    fi
     rm -rf "$WORK_ROOT"
 }
 trap cleanup EXIT HUP INT TERM
@@ -167,9 +170,12 @@ if [ -f "$ORIGIN_INDEX" ] && [ ! -L "$ORIGIN_INDEX" ]; then
         die "managed catalog clone is invalid; keeping the last known-good installation"
     fi
     CONFIGURED_ORIGIN=$(git -C "$MANAGED_REPO" remote get-url origin 2>/dev/null) || die "managed clone has no configured origin"
-    ORIGIN_DIGEST=$(printf '%s' "$CONFIGURED_ORIGIN" | git hash-object --stdin) || die "cannot calculate catalog identity"
-    [ "$ORIGIN_DIGEST" = "$SUPPLIED_DIGEST" ] || die "managed clone origin no longer matches this catalog instance"
-    [ "$INSTANCE_KEY" = "$CATALOG_ID-$ORIGIN_DIGEST" ] || die "catalog origin index identity mismatch"
+    [ -n "$CONFIGURED_ORIGIN" ] || die "managed clone origin must not be blank"
+    INSTANCE_DIGEST=${INSTANCE_KEY#"$CATALOG_ID"-}
+    [ "$INSTANCE_DIGEST" != "$INSTANCE_KEY" ] || die "catalog origin index identity mismatch"
+    [ ${#INSTANCE_DIGEST} -eq 40 ] || die "catalog origin index identity mismatch"
+    case $INSTANCE_DIGEST in *[!0-9a-f]*) die "catalog origin index identity mismatch" ;; esac
+    INSTANCE_CATALOG_ID=$CATALOG_ID
     EXISTING_INSTANCE=1
 else
     # Clone output is deliberately suppressed: Git may echo credential-bearing URLs on failure.
@@ -184,6 +190,7 @@ else
     [ -n "$CONFIGURED_ORIGIN" ] || die "clone origin must not be blank"
     ORIGIN_DIGEST=$(printf '%s' "$CONFIGURED_ORIGIN" | git hash-object --stdin) || die "cannot calculate catalog identity"
     INSTANCE_KEY=$CATALOG_ID-$ORIGIN_DIGEST
+    INSTANCE_CATALOG_ID=$CATALOG_ID
     INSTANCE_ROOT=$STATE_ROOT/catalogs/$INSTANCE_KEY
     MANAGED_REPO=$INSTANCE_ROOT/repo
 fi
@@ -265,7 +272,7 @@ fi
 if ! validate_catalog "$SOURCE_ROOT"; then
     die "catalog is invalid; keeping the last known-good installation"
 fi
-[ "$INSTANCE_KEY" = "$CATALOG_ID-$ORIGIN_DIGEST" ] || die "fetched catalog identity changed; keeping the last known-good installation"
+[ "$CATALOG_ID" = "$INSTANCE_CATALOG_ID" ] || die "fetched catalog identity changed; keeping the last known-good installation"
 if [ "$PREFIX_SET" -eq 0 ]; then
     PREFIX=$DEFAULT_PREFIX
 fi
@@ -335,7 +342,15 @@ if [ ! -d "$GENERATION_PATH" ]; then
 fi
 NEXT_LINK=$INSTALL_ROOT/.current.$$
 ln -s "generations/$GENERATION_ID" "$NEXT_LINK" || die "cannot stage current generation link"
-mv -f "$NEXT_LINK" "$CURRENT_TARGET" || die "cannot activate generated view"
+if [ -e "$CURRENT_TARGET" ] || [ -L "$CURRENT_TARGET" ]; then
+    [ -L "$CURRENT_TARGET" ] || die "catalog current view is not an owned directory link"
+fi
+# Plain POSIX mv follows a destination symlink to a directory. Use each supported platform's
+# no-follow form so replacement changes the link itself and never writes inside an immutable view.
+case $(uname -s) in
+    Darwin) mv -f -h "$NEXT_LINK" "$CURRENT_TARGET" || die "cannot activate generated view" ;;
+    *) mv -f -T "$NEXT_LINK" "$CURRENT_TARGET" || die "cannot activate generated view" ;;
+esac
 
 for product in agents claude; do
     case $product in
