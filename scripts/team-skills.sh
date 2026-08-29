@@ -397,7 +397,7 @@ run_catalog_update() {
             update_remote_head=$(git -C "$update_repo" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || update_failed=1
         fi
         if [ "$update_failed" -eq 0 ]; then
-            update_candidate=$(git -C "$update_repo" rev-parse "$update_remote_head^{commit}" 2>/dev/null) || update_failed=1
+            update_candidate=$(git -C "$update_repo" rev-parse --verify "$update_remote_head" 2>/dev/null) || update_failed=1
         fi
         if [ "$update_failed" -eq 0 ] && ! git -C "$update_repo" merge-base --is-ancestor "$update_previous" "$update_candidate" >/dev/null 2>&1; then
             printf '%s\n' "error: fetched catalog history is not a fast-forward; keeping the last known-good installation" >&2
@@ -824,14 +824,14 @@ else
         case $CANDIDATE_ARGUMENT in *[!0-9a-f]*) die "pinned catalog candidate is invalid" ;; esac
         { [ ${#CANDIDATE_ARGUMENT} -eq 40 ] || [ ${#CANDIDATE_ARGUMENT} -eq 64 ]; } || die "pinned catalog candidate is invalid"
         REMOTE_HEAD=$(git -C "$MANAGED_REPO" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || die "managed origin has no default branch"
-        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse "$REMOTE_HEAD^{commit}" 2>/dev/null) || die "managed origin default branch has no commit"
+        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse --verify "$REMOTE_HEAD" 2>/dev/null) || die "managed origin default branch has no commit"
         [ "$CANDIDATE_REVISION" = "$CANDIDATE_ARGUMENT" ] || die "managed origin candidate changed during catalog update"
     else
         if ! git -C "$MANAGED_REPO" fetch --quiet origin >"$WORK_ROOT/fetch.log" 2>&1; then
             die "unable to fetch the managed catalog origin"
         fi
         REMOTE_HEAD=$(git -C "$MANAGED_REPO" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || die "managed origin has no default branch"
-        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse "$REMOTE_HEAD^{commit}" 2>/dev/null) || die "managed origin default branch has no commit"
+        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse --verify "$REMOTE_HEAD" 2>/dev/null) || die "managed origin default branch has no commit"
     fi
     if ! git -C "$MANAGED_REPO" merge-base --is-ancestor "$PREVIOUS_REPO_HEAD" "$CANDIDATE_REVISION" >/dev/null 2>&1; then
         die "fetched catalog history is not a fast-forward; keeping the last known-good installation"

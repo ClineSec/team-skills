@@ -853,7 +853,7 @@ function Invoke-CatalogUpdate([string]$InstanceKey) {
                 Fail "unable to fetch the managed catalog origin"
             }
             $updateRemoteHead = Get-GitValue @('-C', $managedRepo, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD') "managed origin has no default branch"
-            $updateCandidate = Get-GitValue @('-C', $managedRepo, 'rev-parse', ($updateRemoteHead + '^{commit}')) "managed origin default branch has no commit"
+            $updateCandidate = Get-GitValue @('-C', $managedRepo, 'rev-parse', '--verify', $updateRemoteHead) "managed origin default branch has no commit"
             $captured = ""
             if ((Invoke-Git @('-C', $managedRepo, 'merge-base', '--is-ancestor', $updatePrevious, $updateCandidate) ([ref]$captured)) -ne 0) {
                 Fail "fetched catalog history is not a fast-forward; keeping the last known-good installation"
@@ -1273,7 +1273,7 @@ try {
                 Fail "pinned catalog candidate is invalid"
             }
             $remoteHead = Get-GitValue @('-C', $ManagedRepo, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD') "managed origin has no default branch"
-            $candidateRevisionResolved = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', ($remoteHead + '^{commit}')) "managed origin default branch has no commit"
+            $candidateRevisionResolved = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', '--verify', $remoteHead) "managed origin default branch has no commit"
             if ($candidateRevisionResolved -cne $CandidateRevision) {
                 Fail "managed origin candidate changed during catalog update"
             }
@@ -1285,7 +1285,7 @@ try {
                 Fail "unable to fetch the managed catalog origin"
             }
             $remoteHead = Get-GitValue @('-C', $ManagedRepo, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD') "managed origin has no default branch"
-            $candidateRevision = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', ($remoteHead + '^{commit}')) "managed origin default branch has no commit"
+            $candidateRevision = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', '--verify', $remoteHead) "managed origin default branch has no commit"
         }
         $captured = ""
         if ((Invoke-Git @('-C', $ManagedRepo, 'merge-base', '--is-ancestor', $script:PreviousRepoHead, $candidateRevision) ([ref]$captured)) -ne 0) {
