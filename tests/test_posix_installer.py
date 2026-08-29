@@ -68,6 +68,10 @@ class PosixInstallerTests(unittest.TestCase):
         )
         helper = skill / "scripts" / "helper.sh"
         helper.write_text("#!/bin/sh\nprintf 'fixture\\n'\n", encoding="utf-8")
+        runtime = work / "scripts"
+        runtime.mkdir()
+        shutil.copy2(INSTALLER, runtime / "team-skills.sh")
+        shutil.copy2(ROOT / "scripts" / "team-skills-json.awk", runtime / "team-skills-json.awk")
         if executable_resource:
             helper.chmod(helper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         self.git("init", "--initial-branch=main", str(work))
@@ -105,6 +109,178 @@ class PosixInstallerTests(unittest.TestCase):
         roots = list((self.state / "catalogs").iterdir())
         self.assertEqual(len(roots), 1)
         return roots[0]
+
+    def read_hook_config(self, product: str) -> dict:
+        paths = {
+            "claude": self.home / ".claude" / "settings.json",
+            "codex": self.home / ".codex" / "hooks.json",
+            "cursor": self.home / ".cursor" / "hooks.json",
+        }
+        return json.loads(paths[product].read_text(encoding="utf-8"))
+
+    def owned_hook_commands(self) -> dict[str, str]:
+        instance = self.instance_root()
+        return {
+            product: (instance / "hooks" / f"{product}.owner")
+            .read_text(encoding="utf-8")
+            .splitlines()[1]
+            for product in ("claude", "codex", "cursor")
+        }
+
+    def test_hook_registration_preserves_foreign_config_and_is_idempotent(self) -> None:
+        _, origin = self.make_catalog("hooks", "# Hooks")
+        claude_config = self.home / ".claude" / "settings.json"
+        codex_config = self.home / ".codex" / "hooks.json"
+        cursor_config = self.home / ".cursor" / "hooks.json"
+        for path in (claude_config, codex_config, cursor_config):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        claude_config.write_text(
+            json.dumps(
+                {
+                    "permissions": {"allow": ["Read"]},
+                    "hooks": {"PreToolUse": [{"hooks": [{"command": "foreign-claude"}]}]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        codex_config.write_text(
+            json.dumps({"foreign": True, "hooks": {"Other": [{"command": "foreign-codex"}]}}),
+            encoding="utf-8",
+        )
+        cursor_config.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "hooks": {
+                        "sessionStart": [{"command": "foreign-cursor"}],
+                        "workspaceOpen": [{"command": "keep-workspace"}],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        commands = self.owned_hook_commands()
+        claude = self.read_hook_config("claude")
+        codex = self.read_hook_config("codex")
+        cursor = self.read_hook_config("cursor")
+        self.assertEqual(claude["permissions"], {"allow": ["Read"]})
+        self.assertEqual(claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "foreign-claude")
+        self.assertEqual(claude["hooks"]["SessionStart"][0]["matcher"], "startup|clear")
+        self.assertEqual(claude["hooks"]["SessionStart"][0]["hooks"][0]["command"], commands["claude"])
+        self.assertTrue(claude["hooks"]["SessionStart"][0]["hooks"][0]["async"])
+        self.assertTrue(codex["foreign"])
+        self.assertEqual(codex["hooks"]["SessionStart"][0]["matcher"], "startup|clear")
+        self.assertEqual(codex["hooks"]["SessionStart"][0]["hooks"][0]["command"], commands["codex"])
+        self.assertEqual(cursor["hooks"]["workspaceOpen"], [{"command": "keep-workspace"}])
+        self.assertEqual(
+            cursor["hooks"]["sessionStart"],
+            [{"command": "foreign-cursor"}, {"command": commands["cursor"]}],
+        )
+
+        repeated = self.run_installer("install", origin)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        serialized = {
+            product: json.dumps(self.read_hook_config(product), sort_keys=True)
+            for product in ("claude", "codex", "cursor")
+        }
+        for product, command in commands.items():
+            self.assertEqual(serialized[product].count(command), 1)
+
+    def test_two_catalog_hook_entries_coexist_and_one_removal_is_exact(self) -> None:
+        _, first_origin = self.make_catalog("first-hooks", "# First hooks")
+        _, second_origin = self.make_catalog("second-hooks", "# Second hooks")
+        cursor_config = self.home / ".cursor" / "hooks.json"
+        cursor_config.parent.mkdir(parents=True)
+        cursor_config.write_text(
+            json.dumps({"hooks": {"sessionStart": [{"command": "foreign"}]}}),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_installer("install", first_origin).returncode, 0)
+        self.assertEqual(
+            self.run_installer("install", second_origin, "--prefix", "second").returncode,
+            0,
+        )
+        instances = sorted((self.state / "catalogs").iterdir())
+        commands = {
+            instance.name: (instance / "hooks" / "cursor.owner")
+            .read_text(encoding="utf-8")
+            .splitlines()[1]
+            for instance in instances
+        }
+        before = [entry["command"] for entry in self.read_hook_config("cursor")["hooks"]["sessionStart"]]
+        self.assertEqual(before[0], "foreign")
+        self.assertEqual(set(before[1:]), set(commands.values()))
+
+        removed = self.run_installer("remove", first_origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        after = [entry["command"] for entry in self.read_hook_config("cursor")["hooks"]["sessionStart"]]
+        self.assertEqual(after[0], "foreign")
+        self.assertEqual(len(after), 2)
+        self.assertIn(next(iter((self.state / "catalogs").iterdir())).name, after[1])
+        for product in ("claude", "codex"):
+            serialized = json.dumps(self.read_hook_config(product))
+            self.assertNotIn(commands[[key for key in commands if key not in after[1]][0]], serialized)
+            self.assertIn(after[1], serialized)
+
+    def test_changed_owned_hook_refuses_removal_and_clean_retry_succeeds(self) -> None:
+        _, origin = self.make_catalog("changed-hook", "# Hook ownership")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        cursor_path = self.home / ".cursor" / "hooks.json"
+        original = cursor_path.read_bytes()
+        cursor = json.loads(original)
+        cursor["hooks"]["sessionStart"][0]["command"] += " changed"
+        cursor_path.write_text(json.dumps(cursor), encoding="utf-8")
+
+        refused = self.run_installer("remove", origin)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("no longer owned", refused.stderr)
+        self.assertTrue((self.agents / "common-skill").is_symlink())
+        self.assertTrue(self.instance_root().is_dir())
+
+        cursor_path.write_bytes(original)
+        retried = self.run_installer("remove", origin)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertFalse((self.agents / "common-skill").exists())
+        self.assertEqual(list((self.state / "catalogs").glob("*")), [])
+
+    def test_malformed_hook_config_refuses_install_without_overwrite(self) -> None:
+        _, origin = self.make_catalog("malformed-hooks", "# Hooks")
+        claude_config = self.home / ".claude" / "settings.json"
+        claude_config.parent.mkdir(parents=True)
+        malformed = b'{"hooks":'
+        claude_config.write_bytes(malformed)
+
+        installed = self.run_installer("install", origin)
+        self.assertNotEqual(installed.returncode, 0)
+        self.assertIn("malformed, unsupported", installed.stderr)
+        self.assertEqual(claude_config.read_bytes(), malformed)
+        self.assertFalse((self.agents / "common-skill").exists())
+        self.assertFalse((self.home / ".codex" / "hooks.json").exists())
+        self.assertFalse((self.home / ".cursor" / "hooks.json").exists())
+
+    def test_hook_command_quotes_metacharacter_and_unicode_state_path(self) -> None:
+        self.state = self.base / "state 🧪 with '$dollar"
+        self.env["TEAM_SKILLS_STATE_ROOT"] = str(self.state)
+        _, origin = self.make_catalog("quoted-hooks", "# Hooks")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        command = self.owned_hook_commands()["claude"]
+        self.assertIn("'\\''", command)
+        self.env.update(
+            {
+                "TEAM_SKILLS_TEST_FOREGROUND": "1",
+                "TEAM_SKILLS_NOW": "2000000000",
+            }
+        )
+        invoked = subprocess.run(
+            ["sh", "-c", command], text=True, capture_output=True, check=False, env=self.env
+        )
+        self.assertEqual(invoked.returncode, 0, invoked.stderr)
+        self.assertTrue((self.instance_root() / "last-success").is_file())
 
     def test_two_origins_collision_prefix_idempotence_and_safe_remove(self) -> None:
         _, first_origin = self.make_catalog("first", "# First catalog")

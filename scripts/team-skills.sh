@@ -26,6 +26,9 @@ Environment overrides (primarily for tests and managed environments):
   TEAM_SKILLS_STATE_ROOT   default: \${XDG_DATA_HOME:-\$HOME/.local/share}/team-skills
   TEAM_SKILLS_AGENTS_ROOT  default: \$HOME/.agents/skills
   TEAM_SKILLS_CLAUDE_ROOT  default: \$HOME/.claude/skills
+  TEAM_SKILLS_CLAUDE_HOOKS_FILE  default: \$HOME/.claude/settings.json
+  TEAM_SKILLS_CODEX_HOOKS_FILE   default: \${CODEX_HOME:-\$HOME/.codex}/hooks.json
+  TEAM_SKILLS_CURSOR_HOOKS_FILE  default: \$HOME/.cursor/hooks.json
   TEAM_SKILLS_THROTTLE_SECONDS  default: 21600 (six hours)
 EOF
     exit 2
@@ -77,6 +80,9 @@ fi
 STATE_ROOT=${TEAM_SKILLS_STATE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/team-skills}
 AGENTS_ROOT=${TEAM_SKILLS_AGENTS_ROOT:-$HOME/.agents/skills}
 CLAUDE_ROOT=${TEAM_SKILLS_CLAUDE_ROOT:-$HOME/.claude/skills}
+CLAUDE_HOOKS_FILE=${TEAM_SKILLS_CLAUDE_HOOKS_FILE:-$HOME/.claude/settings.json}
+CODEX_HOOKS_FILE=${TEAM_SKILLS_CODEX_HOOKS_FILE:-${CODEX_HOME:-$HOME/.codex}/hooks.json}
+CURSOR_HOOKS_FILE=${TEAM_SKILLS_CURSOR_HOOKS_FILE:-$HOME/.cursor/hooks.json}
 
 reject_unsafe_root() {
     root_value=$1
@@ -96,6 +102,171 @@ reject_unsafe_root() {
 reject_unsafe_root "$STATE_ROOT" TEAM_SKILLS_STATE_ROOT
 reject_unsafe_root "$AGENTS_ROOT" TEAM_SKILLS_AGENTS_ROOT
 reject_unsafe_root "$CLAUDE_ROOT" TEAM_SKILLS_CLAUDE_ROOT
+reject_unsafe_root "$CLAUDE_HOOKS_FILE" TEAM_SKILLS_CLAUDE_HOOKS_FILE
+reject_unsafe_root "$CODEX_HOOKS_FILE" TEAM_SKILLS_CODEX_HOOKS_FILE
+reject_unsafe_root "$CURSOR_HOOKS_FILE" TEAM_SKILLS_CURSOR_HOOKS_FILE
+
+shell_quote() {
+    printf "'"
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
+    printf "'"
+}
+
+hook_config_path() {
+    case $1 in
+        claude) printf '%s\n' "$CLAUDE_HOOKS_FILE" ;;
+        codex) printf '%s\n' "$CODEX_HOOKS_FILE" ;;
+        cursor) printf '%s\n' "$CURSOR_HOOKS_FILE" ;;
+        *) return 1 ;;
+    esac
+}
+
+prepare_hook_edit() {
+    hook_operation=$1
+    hook_product=$2
+    hook_config=$3
+    hook_command=$4
+    hook_stage=$WORK_ROOT/hooks/$hook_product
+    mkdir -p "$hook_stage"
+    hook_before=$hook_stage/before.json
+    hook_after=$hook_stage/after.json
+    hook_existed=$hook_stage/existed
+
+    if [ -e "$hook_config" ] || [ -L "$hook_config" ]; then
+        [ -f "$hook_config" ] && [ ! -L "$hook_config" ] || die "$hook_product hook configuration is not a regular file"
+        cp "$hook_config" "$hook_before" || die "cannot stage $hook_product hook configuration"
+        : >"$hook_existed"
+    else
+        printf '{}\n' >"$hook_before"
+    fi
+    if ! TEAM_SKILLS_JSON_COMMAND=$hook_command awk -v operation="$hook_operation" -v product="$hook_product" \
+        -f "$HOOK_EDITOR" "$hook_before" >"$hook_after"; then
+        rm -f "$hook_after"
+        die "$hook_product hook configuration is malformed, unsupported, or no longer owned"
+    fi
+}
+
+prepare_hook_registration() {
+    HOOK_EDITOR=$SOURCE_ROOT/scripts/team-skills-json.awk
+    HOOK_RUNTIME=$MANAGED_REPO/scripts/team-skills.sh
+    [ -f "$HOOK_EDITOR" ] && [ ! -L "$HOOK_EDITOR" ] || die "catalog is missing its POSIX hook editor"
+    [ -f "$SOURCE_ROOT/scripts/team-skills.sh" ] && [ ! -L "$SOURCE_ROOT/scripts/team-skills.sh" ] || die "catalog is missing its POSIX lifecycle utility"
+    HOOK_COMMAND="sh $(shell_quote "$HOOK_RUNTIME") hook $(shell_quote "$INSTANCE_KEY")"
+    HOOK_OWNERSHIP_ROOT=$INSTANCE_ROOT/hooks
+    for hook_product in claude codex cursor; do
+        hook_config=$(hook_config_path "$hook_product")
+        hook_owner=$HOOK_OWNERSHIP_ROOT/$hook_product.owner
+        if [ -f "$hook_owner" ] && [ ! -L "$hook_owner" ]; then
+            [ "$(sed -n '1p' "$hook_owner")" = "$hook_config" ] || die "$hook_product hook ownership path changed"
+            [ "$(sed -n '2p' "$hook_owner")" = "$HOOK_COMMAND" ] || die "$hook_product hook ownership command changed"
+        elif [ -e "$hook_owner" ] || [ -L "$hook_owner" ]; then
+            die "$hook_product hook ownership state is invalid"
+        fi
+        prepare_hook_edit add "$hook_product" "$hook_config" "$HOOK_COMMAND"
+    done
+    HOOK_CHANGES_PREPARED=1
+}
+
+prepare_hook_removal() {
+    HOOK_OWNERSHIP_ROOT=$INSTANCE_ROOT/hooks
+    [ -d "$HOOK_OWNERSHIP_ROOT" ] && [ ! -L "$HOOK_OWNERSHIP_ROOT" ] || return 0
+    HOOK_EDITOR=$MANAGED_REPO/scripts/team-skills-json.awk
+    [ -f "$HOOK_EDITOR" ] && [ ! -L "$HOOK_EDITOR" ] || die "catalog POSIX hook editor is missing"
+    for hook_product in claude codex cursor; do
+        hook_owner=$HOOK_OWNERSHIP_ROOT/$hook_product.owner
+        if [ ! -e "$hook_owner" ] && [ ! -L "$hook_owner" ]; then
+            continue
+        fi
+        [ -f "$hook_owner" ] && [ ! -L "$hook_owner" ] || die "$hook_product hook ownership state is invalid"
+        hook_config=$(sed -n '1p' "$hook_owner")
+        hook_command=$(sed -n '2p' "$hook_owner")
+        reject_unsafe_root "$hook_config" "$hook_product owned hook configuration path"
+        expected_command="sh $(shell_quote "$MANAGED_REPO/scripts/team-skills.sh") hook $(shell_quote "$INSTANCE_KEY")"
+        [ "$hook_command" = "$expected_command" ] || die "$hook_product hook ownership command no longer matches its target"
+        prepare_hook_edit remove "$hook_product" "$hook_config" "$hook_command"
+    done
+    HOOK_CHANGES_PREPARED=1
+}
+
+rollback_hook_changes() {
+    [ "${HOOK_CHANGES_COMMITTED:-0}" -eq 1 ] || return 0
+    hook_rollback_failed=0
+    for hook_product in claude codex cursor; do
+        hook_stage=$WORK_ROOT/hooks/$hook_product
+        [ -f "$hook_stage/committed" ] || continue
+        hook_config=$(sed -n '1p' "$hook_stage/path")
+        if [ -f "$hook_config" ] && [ ! -L "$hook_config" ] && cmp -s "$hook_config" "$hook_stage/after.json"; then
+            if [ -f "$hook_stage/existed" ]; then
+                hook_restore=$hook_config.team-skills-rollback.$$
+                cp "$hook_stage/before.json" "$hook_restore" && mv "$hook_restore" "$hook_config" || hook_rollback_failed=1
+            else
+                rm "$hook_config" || hook_rollback_failed=1
+            fi
+        else
+            hook_rollback_failed=1
+        fi
+    done
+    HOOK_CHANGES_COMMITTED=0
+    [ "$hook_rollback_failed" -eq 0 ]
+}
+
+commit_hook_changes() {
+    [ "${HOOK_CHANGES_PREPARED:-0}" -eq 1 ] || return 0
+    HOOK_CHANGES_COMMITTED=1
+    for hook_product in claude codex cursor; do
+        hook_stage=$WORK_ROOT/hooks/$hook_product
+        [ -f "$hook_stage/after.json" ] || continue
+        hook_config=$(hook_config_path "$hook_product")
+        # Removal uses the path recorded by the owner rather than a possibly changed override.
+        if [ "$ACTION" = remove ]; then
+            hook_config=$(sed -n '1p' "$INSTANCE_ROOT/hooks/$hook_product.owner")
+        fi
+        printf '%s\n' "$hook_config" >"$hook_stage/path"
+        if [ -f "$hook_stage/existed" ]; then
+            [ -f "$hook_config" ] && [ ! -L "$hook_config" ] && cmp -s "$hook_config" "$hook_stage/before.json" || {
+                rollback_hook_changes || :
+                die "$hook_product hook configuration changed during installation"
+            }
+        else
+            [ ! -e "$hook_config" ] && [ ! -L "$hook_config" ] || {
+                rollback_hook_changes || :
+                die "$hook_product hook configuration appeared during installation"
+            }
+        fi
+        hook_parent=${hook_config%/*}
+        mkdir -p "$hook_parent" || {
+            rollback_hook_changes || :
+            die "cannot create $hook_product configuration directory"
+        }
+        hook_temp=$hook_parent/.team-skills-hooks.$$
+        if ! cp "$hook_stage/after.json" "$hook_temp" || ! mv "$hook_temp" "$hook_config"; then
+            rm -f "$hook_temp"
+            rollback_hook_changes || :
+            die "cannot atomically update $hook_product hook configuration"
+        fi
+        : >"$hook_stage/committed"
+    done
+}
+
+finalize_hook_ownership() {
+    [ "${HOOK_CHANGES_PREPARED:-0}" -eq 1 ] || return 0
+    if [ "$ACTION" = remove ]; then
+        rm -rf "$HOOK_OWNERSHIP_ROOT"
+        return 0
+    fi
+    if [ -e "$HOOK_OWNERSHIP_ROOT" ] || [ -L "$HOOK_OWNERSHIP_ROOT" ]; then
+        [ -d "$HOOK_OWNERSHIP_ROOT" ] && [ ! -L "$HOOK_OWNERSHIP_ROOT" ] || die "catalog hook ownership root is invalid"
+    else
+        mkdir -p "$HOOK_OWNERSHIP_ROOT" || die "cannot create catalog hook ownership state"
+    fi
+    for hook_product in claude codex cursor; do
+        hook_config=$(hook_config_path "$hook_product")
+        hook_owner=$HOOK_OWNERSHIP_ROOT/$hook_product.owner
+        hook_owner_temp=$HOOK_OWNERSHIP_ROOT/.$hook_product.owner.$$
+        printf '%s\n%s\n' "$hook_config" "$HOOK_COMMAND" >"$hook_owner_temp" && \
+            mv "$hook_owner_temp" "$hook_owner" || die "cannot record $hook_product hook ownership"
+    done
+}
 
 valid_instance_key() {
     candidate_key=$1
@@ -269,6 +440,8 @@ rollback_transaction() {
     [ "${TRANSACTION_ACTIVE:-0}" -eq 1 ] || return 0
     TRANSACTION_ACTIVE=0
     rollback_failed=0
+
+    rollback_hook_changes || rollback_failed=1
 
     # Remove newly created links while their candidate targets still exist. This keeps
     # ownership proof inspectable for Windows junctions as well as POSIX symlinks.
@@ -495,6 +668,15 @@ if [ "$ACTION" = remove ]; then
         printf '%s\n' "Catalog $CATALOG_ID prefix '$PREFIX' is already absent."
         exit 0
     }
+    remaining_install=0
+    for installed_view in "$INSTANCE_ROOT/installs"/*; do
+        [ -d "$installed_view" ] && [ ! -L "$installed_view" ] || continue
+        [ "$installed_view" = "$INSTALL_ROOT" ] || remaining_install=1
+    done
+    if [ "$remaining_install" -eq 0 ]; then
+        prepare_hook_removal
+        commit_hook_changes
+    fi
     for product in agents claude; do
         case $product in
             agents) product_root=$AGENTS_ROOT ;;
@@ -521,6 +703,8 @@ if [ "$ACTION" = remove ]; then
         if [ -f "$ORIGIN_INDEX" ] && [ "$(sed -n '1p' "$ORIGIN_INDEX")" = "$INSTANCE_KEY" ]; then
             rm "$ORIGIN_INDEX"
         fi
+    elif [ "$remaining_install" -eq 0 ]; then
+        die "catalog installation state could not be removed after unregistering hooks"
     fi
     printf '%s\n' "Removed catalog $CATALOG_ID prefix '$PREFIX'."
     exit 0
@@ -556,6 +740,9 @@ if ! validate_catalog "$SOURCE_ROOT"; then
     die "catalog is invalid; keeping the last known-good installation"
 fi
 [ "$CATALOG_ID" = "$INSTANCE_CATALOG_ID" ] || die "fetched catalog identity changed; keeping the last known-good installation"
+if [ "$ACTION" = install ]; then
+    prepare_hook_registration
+fi
 if [ "$PREFIX_SET" -eq 0 ]; then
     PREFIX=$DEFAULT_PREFIX
 fi
@@ -687,5 +874,7 @@ done
 if [ -n "${CANDIDATE_WORKTREE:-}" ]; then
     git -C "$MANAGED_REPO" reset --quiet --hard "$REMOTE_HEAD" >"$WORK_ROOT/reset.log" 2>&1 || die "installed view is valid but managed clone could not advance"
 fi
+commit_hook_changes
+finalize_hook_ownership
 TRANSACTION_ACTIVE=0
 printf '%s\n' "Installed catalog $CATALOG_ID as instance $INSTANCE_KEY with prefix '$PREFIX'."
