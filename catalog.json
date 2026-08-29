@@ -1,0 +1,8 @@
+{
+  "$schema": "./schemas/catalog.schema.json",
+  "schema_version": 1,
+  "catalog_id": "team-skills",
+  "display_name": "Team Skills",
+  "skills_directory": "skills",
+  "default_prefix": ""
+}
