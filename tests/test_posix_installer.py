@@ -245,6 +245,11 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertEqual(installed.returncode, 0, installed.stderr)
         original = (self.agents / "common-skill" / "SKILL.md").read_bytes()
 
+        common_skill = work / "skills" / "common-skill" / "SKILL.md"
+        common_skill.write_text(
+            common_skill.read_text(encoding="utf-8").replace("# Known good", "# Candidate"),
+            encoding="utf-8",
+        )
         new_skill = work / "skills" / "new-skill"
         new_skill.mkdir()
         (new_skill / "SKILL.md").write_text(
@@ -274,6 +279,7 @@ class PosixInstallerTests(unittest.TestCase):
         )
         ln_wrapper.chmod(0o755)
         self.env["TEAM_SKILLS_TEST_REAL_LN"] = real_ln or ""
+        original_path = self.env["PATH"]
         self.env["PATH"] = str(command_bin) + os.pathsep + self.env["PATH"]
 
         failed = self.run_installer("install", origin)
@@ -290,6 +296,78 @@ class PosixInstallerTests(unittest.TestCase):
             / "new-skill.owner"
         )
         self.assertFalse(ownership.exists())
+
+        install_root = ownership.parents[2]
+        current = install_root / "current"
+        self.assertIn("# Known good", (current / "common-skill" / "SKILL.md").read_text())
+        for product_root, product in ((self.agents, "agents"), (self.claude, "claude")):
+            owner_file = install_root / "ownership" / product / "common-skill.owner"
+            self.assertTrue(owner_file.is_file())
+            self.assertEqual(os.readlink(product_root / "common-skill"), owner_file.read_text().strip())
+
+        self.env["PATH"] = original_path
+        (self.agents / "new-skill").unlink()
+        rerun = self.run_installer("install", origin)
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertIn("# Candidate", (self.agents / "common-skill" / "SKILL.md").read_text())
+        self.assertIn("# New skill", (self.claude / "new-skill" / "SKILL.md").read_text())
+
+        removed = self.run_installer("remove", origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        for product_root in (self.agents, self.claude):
+            self.assertFalse((product_root / "common-skill").exists())
+            self.assertFalse((product_root / "new-skill").exists())
+
+    def test_failed_first_install_removes_partial_catalog_exposures(self) -> None:
+        work, origin = self.make_catalog("first-race", "# Initial")
+        new_skill = work / "skills" / "new-skill"
+        new_skill.mkdir()
+        (new_skill / "SKILL.md").write_text(
+            "---\nname: new-skill\ndescription: A new fixture skill.\n---\n\n# New skill\n",
+            encoding="utf-8",
+        )
+        self.git("add", ".", cwd=work)
+        self.git("commit", "-m", "add second initial skill", cwd=work)
+        self.git("push", cwd=work)
+
+        command_bin = self.base / "first install racing bin"
+        command_bin.mkdir()
+        real_ln = shutil.which("ln")
+        self.assertIsNotNone(real_ln)
+        ln_wrapper = command_bin / "ln"
+        ln_wrapper.write_text(
+            "#!/bin/sh\n"
+            "last=\n"
+            "for argument do last=$argument; done\n"
+            "case $last in\n"
+            "  */.agents/skills/new-skill)\n"
+            "    printf 'first race winner\\n' >\"$last\"\n"
+            "    ;;\n"
+            "esac\n"
+            'exec "$TEAM_SKILLS_TEST_REAL_LN" "$@"\n',
+            encoding="utf-8",
+        )
+        ln_wrapper.chmod(0o755)
+        self.env["TEAM_SKILLS_TEST_REAL_LN"] = real_ln or ""
+        original_path = self.env["PATH"]
+        self.env["PATH"] = str(command_bin) + os.pathsep + original_path
+
+        failed = self.run_installer("install", origin)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("cannot expose skill new-skill", failed.stderr)
+        self.assertEqual((self.agents / "new-skill").read_bytes(), b"first race winner\n")
+        self.assertFalse((self.agents / "common-skill").exists())
+        self.assertFalse((self.claude / "common-skill").exists())
+        install_root = next((self.state / "catalogs").iterdir()) / "installs" / "_default"
+        self.assertFalse((install_root / "current").exists())
+        self.assertEqual(list((install_root / "ownership").rglob("*.owner")), [])
+
+        self.env["PATH"] = original_path
+        (self.agents / "new-skill").unlink()
+        rerun = self.run_installer("install", origin)
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertTrue((self.agents / "common-skill").is_symlink())
+        self.assertTrue((self.claude / "new-skill").is_symlink())
 
     def test_clone_failure_does_not_print_credentials(self) -> None:
         secret_url = "file://fixture-user:fixture-password@/definitely/missing/catalog.git"

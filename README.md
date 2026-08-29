@@ -119,8 +119,12 @@ must be absolute, non-root paths.
 
 Clone and fetch diagnostics are suppressed so credential-bearing URLs are not echoed. Malformed
 catalogs, invalid names, failed fetches, and failed generation do not replace the last known-good
-view. Interrupted temporary work is removed on the next process cleanup; validated generations
-are immutable and activation is atomic at the `current` link.
+view. Candidate activation, exposure reconciliation, ownership records, and managed-clone
+advancement form one transaction: a late destination race or other unsuccessful install restores
+the prior view and removes only newly created, still-proven catalog exposures. On a first-install
+failure, no partial catalog exposure remains. The racing or user-owned path is never overwritten.
+Interrupted temporary work is removed during process cleanup; validated generations are immutable
+and activation is atomic at the `current` link.
 
 ## What is not automatic yet
 

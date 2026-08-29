@@ -20,6 +20,15 @@ $PrefixWasSupplied = $PSBoundParameters.ContainsKey("Prefix")
 $WorkRoot = $null
 $CandidateWorktree = $null
 $ManagedRepo = $null
+$script:TransactionActive = $false
+$script:CreatedExposures = @()
+$script:InstallRoot = $null
+$script:CurrentTarget = $null
+$script:GenerationPath = $null
+$script:OwnershipSnapshot = $null
+$script:HadPreviousGeneration = $false
+$script:PreviousGenerationTarget = $null
+$script:PreviousRepoHead = $null
 
 function Fail([string]$Message) {
     throw [System.InvalidOperationException]::new($Message)
@@ -232,6 +241,79 @@ function Activate-Generation([string]$InstallRoot, [string]$GenerationPath) {
     Remove-DirectoryExposure $previous
 }
 
+function Invoke-TransactionRollback {
+    if (-not $script:TransactionActive) { return }
+    $script:TransactionActive = $false
+    $rollbackFailed = $false
+
+    # Remove newly created links while their candidate targets still exist, so junction
+    # ownership remains inspectable before the current generation is restored.
+    foreach ($created in $script:CreatedExposures) {
+        try {
+            if (Test-OwnedExposure $created.Path $created.ExpectedTarget) {
+                Remove-DirectoryExposure $created.Path
+            }
+        }
+        catch { $rollbackFailed = $true }
+    }
+
+    try {
+        if ($script:HadPreviousGeneration) {
+            Activate-Generation $script:InstallRoot $script:PreviousGenerationTarget
+        }
+        elseif ((Test-PathEntry $script:CurrentTarget) -and
+                (Test-OwnedExposure $script:CurrentTarget $script:GenerationPath)) {
+            Remove-DirectoryExposure $script:CurrentTarget
+        }
+    }
+    catch { $rollbackFailed = $true }
+
+    if ($null -ne $script:OwnershipSnapshot -and (Test-PathEntry $script:OwnershipSnapshot)) {
+        try {
+            $ownershipRoot = Join-Path $script:InstallRoot "ownership"
+            if (Test-PathEntry $ownershipRoot) {
+                Remove-Item -Recurse -Force -LiteralPath $ownershipRoot
+            }
+            $null = New-Item -ItemType Directory -Path $ownershipRoot
+            foreach ($snapshotItem in @(Get-ChildItem -Force -LiteralPath $script:OwnershipSnapshot)) {
+                Copy-Item -Recurse -LiteralPath $snapshotItem.FullName -Destination $ownershipRoot
+            }
+            foreach ($product in @('agents', 'claude')) {
+                $productRoot = if ($product -ceq 'agents') { $AgentsRoot } else { $ClaudeRoot }
+                $owners = Join-Path $ownershipRoot $product
+                foreach ($ownerFile in @(Get-ChildItem -File -Filter "*.owner" -LiteralPath $owners)) {
+                    $effectiveName = $ownerFile.BaseName
+                    $destination = Join-Path $productRoot $effectiveName
+                    $expectedTarget = ([System.IO.File]::ReadAllText($ownerFile.FullName)).Trim()
+                    if (Test-OwnedExposure $destination $expectedTarget) { continue }
+                    if (Test-PathEntry $destination) {
+                        Remove-Item -Force -LiteralPath $ownerFile.FullName
+                        continue
+                    }
+                    try {
+                        New-DirectoryExposure $destination $expectedTarget
+                    }
+                    catch {
+                        Remove-Item -Force -LiteralPath $ownerFile.FullName
+                        $rollbackFailed = $true
+                    }
+                }
+            }
+        }
+        catch { $rollbackFailed = $true }
+    }
+
+    if ($null -ne $script:PreviousRepoHead -and $null -ne $ManagedRepo) {
+        $captured = ""
+        if ((Invoke-Git @('-C', $ManagedRepo, 'reset', '--quiet', '--hard', $script:PreviousRepoHead) ([ref]$captured)) -ne 0) {
+            $rollbackFailed = $true
+        }
+    }
+    if ($rollbackFailed) {
+        [Console]::Error.WriteLine("warning: installation rollback could not fully restore catalog-owned state")
+    }
+}
+
 try {
     if ([string]::IsNullOrWhiteSpace($RepositoryUrl)) {
         Fail "repository URL must not be blank"
@@ -353,6 +435,7 @@ try {
         $sourceRoot = $ManagedRepo
     }
     else {
+        $script:PreviousRepoHead = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', 'HEAD') "managed catalog clone has no Git revision"
         $captured = ""
         if ((Invoke-Git @('-C', $ManagedRepo, 'fetch', '--quiet', 'origin') ([ref]$captured)) -ne 0) {
             Fail "unable to fetch the managed catalog origin"
@@ -402,6 +485,13 @@ try {
     }
     $generationPath = Join-Path $generationsRoot $generationId
     $currentTarget = Join-Path $installRoot "current"
+    $exposurePlan = Join-Path $WorkRoot "exposure-plan"
+    $script:OwnershipSnapshot = Join-Path $WorkRoot "ownership.before"
+    $null = New-Item -ItemType Directory -Path $exposurePlan
+    foreach ($product in @('agents', 'claude')) {
+        $null = New-Item -ItemType Directory -Path (Join-Path $exposurePlan $product)
+    }
+    Copy-Item -Recurse -LiteralPath $ownershipRoot -Destination $script:OwnershipSnapshot
 
     foreach ($product in @('agents', 'claude')) {
         $productRoot = if ($product -ceq 'agents') { $AgentsRoot } else { $ClaudeRoot }
@@ -415,12 +505,30 @@ try {
             if ((Test-PathEntry $destination) -and -not ((Test-PathEntry $ownerFile) -and (Test-OwnedExposure $destination $expectedTarget))) {
                 [Console]::Error.WriteLine("warning: catalog $($manifest.catalog_id) skill $($generatedSkill.Name) skipped; destination exists: $destination")
             }
+            elseif (-not (Test-PathEntry $destination)) {
+                $planFile = Join-Path (Join-Path $exposurePlan $product) ($generatedSkill.Name + ".create")
+                $null = New-Item -ItemType File -Path $planFile
+            }
         }
     }
 
     if (-not (Test-PathEntry $generationPath)) {
         Move-Item -LiteralPath $stagedGeneration -Destination $generationPath
     }
+    $script:InstallRoot = $installRoot
+    $script:CurrentTarget = $currentTarget
+    $script:GenerationPath = $generationPath
+    if (Test-PathEntry $currentTarget) {
+        $script:PreviousGenerationTarget = Get-LinkTarget $currentTarget
+        if ($null -eq $script:PreviousGenerationTarget) {
+            Fail "catalog current view is not an owned directory link"
+        }
+        $script:HadPreviousGeneration = $true
+    }
+    else {
+        $script:HadPreviousGeneration = $false
+    }
+    $script:TransactionActive = $true
     Activate-Generation $installRoot $generationPath
 
     foreach ($product in @('agents', 'claude')) {
@@ -441,22 +549,23 @@ try {
             Remove-Item -Force -LiteralPath $ownerFile.FullName
         }
         foreach ($generatedSkill in @(Get-ChildItem -Directory -LiteralPath $currentTarget)) {
+            $planFile = Join-Path (Join-Path $exposurePlan $product) ($generatedSkill.Name + ".create")
+            if (-not (Test-PathEntry $planFile)) { continue }
             $destination = Join-Path $productRoot $generatedSkill.Name
             $ownerFile = Join-Path $owners ($generatedSkill.Name + ".owner")
             $expectedTarget = Join-Path $currentTarget $generatedSkill.Name
-            if (Test-PathEntry $destination) {
-                if ((Test-PathEntry $ownerFile) -and (Test-OwnedExposure $destination $expectedTarget)) { continue }
-                continue
+            $script:CreatedExposures += [PSCustomObject]@{
+                Path = $destination
+                ExpectedTarget = $expectedTarget
             }
-            [System.IO.File]::WriteAllText($ownerFile, $expectedTarget + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
             try {
                 # Creating the final junction/symlink is atomic and fails if a racing path exists.
                 New-DirectoryExposure $destination $expectedTarget
             }
             catch {
-                Remove-Item -Force -LiteralPath $ownerFile
                 Fail "cannot expose skill $($generatedSkill.Name)"
             }
+            [System.IO.File]::WriteAllText($ownerFile, $expectedTarget + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
         }
     }
 
@@ -466,10 +575,13 @@ try {
             Fail "installed view is valid but managed clone could not advance"
         }
     }
+    $script:TransactionActive = $false
     Write-Output "Installed catalog $($manifest.catalog_id) as instance $instanceKey with prefix '$Prefix'."
 }
 catch {
-    [Console]::Error.WriteLine("error: " + $_.Exception.Message)
+    $failureMessage = $_.Exception.Message
+    Invoke-TransactionRollback
+    [Console]::Error.WriteLine("error: " + $failureMessage)
     exit 1
 }
 finally {

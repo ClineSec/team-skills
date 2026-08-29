@@ -77,6 +77,7 @@ reject_unsafe_root "$CLAUDE_ROOT" TEAM_SKILLS_CLAUDE_ROOT
 mkdir -p "$STATE_ROOT" || die "cannot create state root"
 WORK_ROOT=$(mktemp -d "$STATE_ROOT/.operation.XXXXXXXX") || die "cannot create temporary state"
 cleanup() {
+    rollback_transaction
     if [ -n "${CANDIDATE_WORKTREE:-}" ] && [ -n "${MANAGED_REPO:-}" ]; then
         git -C "$MANAGED_REPO" worktree remove --force "$CANDIDATE_WORKTREE" >/dev/null 2>&1 || :
     fi
@@ -86,6 +87,93 @@ cleanup() {
     rm -rf "$WORK_ROOT"
 }
 trap cleanup EXIT HUP INT TERM
+
+replace_link() {
+    replacement=$1
+    destination=$2
+    case $(uname -s) in
+        Darwin) mv -f -h "$replacement" "$destination" ;;
+        *) mv -f -T "$replacement" "$destination" ;;
+    esac
+}
+
+rollback_transaction() {
+    [ "${TRANSACTION_ACTIVE:-0}" -eq 1 ] || return 0
+    TRANSACTION_ACTIVE=0
+    rollback_failed=0
+
+    # Remove newly created links while their candidate targets still exist. This keeps
+    # ownership proof inspectable for Windows junctions as well as POSIX symlinks.
+    if [ -f "${CREATED_EXPOSURES:-}" ]; then
+        while IFS=/ read -r product effective_name; do
+            case $product in
+                agents) product_root=$AGENTS_ROOT ;;
+                claude) product_root=$CLAUDE_ROOT ;;
+                *) rollback_failed=1; continue ;;
+            esac
+            destination=$product_root/$effective_name
+            expected_target=$CURRENT_TARGET/$effective_name
+            if [ -L "$destination" ] && [ "$(readlink "$destination")" = "$expected_target" ]; then
+                rm "$destination" || rollback_failed=1
+            fi
+        done <"$CREATED_EXPOSURES"
+    fi
+
+    if [ "${HAD_PREVIOUS_GENERATION:-0}" -eq 1 ]; then
+        rollback_link=$INSTALL_ROOT/.rollback.$$
+        if ln -s "$PREVIOUS_CURRENT_LINK" "$rollback_link" && replace_link "$rollback_link" "$CURRENT_TARGET"; then
+            :
+        else
+            rollback_failed=1
+            rm -f "$rollback_link" >/dev/null 2>&1 || :
+        fi
+    elif [ -L "$CURRENT_TARGET" ] && [ "$(readlink "$CURRENT_TARGET")" = "generations/$GENERATION_ID" ]; then
+        rm "$CURRENT_TARGET" || rollback_failed=1
+    fi
+
+    if [ -n "${OWNERSHIP_SNAPSHOT:-}" ] && [ -d "$OWNERSHIP_SNAPSHOT" ]; then
+        if ! rm -rf "$INSTALL_ROOT/ownership"; then
+            rollback_failed=1
+        elif ! cp -Rp "$OWNERSHIP_SNAPSHOT" "$INSTALL_ROOT/ownership"; then
+            rollback_failed=1
+        else
+            # If an old exposure was removed before the failure, restore it only if its
+            # destination is still absent. A racing replacement revokes ownership instead.
+            for product in agents claude; do
+                case $product in
+                    agents) product_root=$AGENTS_ROOT ;;
+                    claude) product_root=$CLAUDE_ROOT ;;
+                esac
+                owners=$INSTALL_ROOT/ownership/$product
+                for owner_file in "$owners"/*.owner; do
+                    [ -f "$owner_file" ] || continue
+                    effective_name=${owner_file##*/}
+                    effective_name=${effective_name%.owner}
+                    destination=$product_root/$effective_name
+                    expected_target=$(sed -n '1p' "$owner_file")
+                    if [ -L "$destination" ] && [ "$(readlink "$destination")" = "$expected_target" ]; then
+                        continue
+                    fi
+                    if [ -e "$destination" ] || [ -L "$destination" ]; then
+                        rm "$owner_file" || rollback_failed=1
+                        continue
+                    fi
+                    if ! ln -s "$expected_target" "$destination"; then
+                        rm -f "$owner_file"
+                        rollback_failed=1
+                    fi
+                done
+            done
+        fi
+    fi
+
+    if [ -n "${PREVIOUS_REPO_HEAD:-}" ] && [ -n "${MANAGED_REPO:-}" ]; then
+        git -C "$MANAGED_REPO" reset --quiet --hard "$PREVIOUS_REPO_HEAD" >/dev/null 2>&1 || rollback_failed=1
+    fi
+    if [ "$rollback_failed" -ne 0 ]; then
+        printf '%s\n' "warning: installation rollback could not fully restore catalog-owned state" >&2
+    fi
+}
 
 valid_name() {
     value=$1
@@ -254,6 +342,7 @@ if [ "$EXISTING_INSTANCE" -eq 0 ]; then
     SOURCE_ROOT=$MANAGED_REPO
 else
     # All later network behavior names the managed clone's configured origin, never a baked URL.
+    PREVIOUS_REPO_HEAD=$(git -C "$MANAGED_REPO" rev-parse HEAD 2>/dev/null) || die "managed catalog clone has no Git revision"
     if ! git -C "$MANAGED_REPO" fetch --quiet origin >"$WORK_ROOT/fetch.log" 2>&1; then
         die "unable to fetch the managed catalog origin"
     fi
@@ -312,6 +401,12 @@ done
 mkdir -p "$INSTALL_ROOT/generations" "$INSTALL_ROOT/ownership/agents" "$INSTALL_ROOT/ownership/claude"
 GENERATION_PATH=$INSTALL_ROOT/generations/$GENERATION_ID
 CURRENT_TARGET=$INSTALL_ROOT/current
+EXPOSURE_PLAN=$WORK_ROOT/exposure-plan
+CREATED_EXPOSURES=$WORK_ROOT/created-exposures
+OWNERSHIP_SNAPSHOT=$WORK_ROOT/ownership.before
+mkdir -p "$EXPOSURE_PLAN/agents" "$EXPOSURE_PLAN/claude"
+cp -Rp "$INSTALL_ROOT/ownership" "$OWNERSHIP_SNAPSHOT" || die "cannot snapshot catalog ownership state"
+: >"$CREATED_EXPOSURES"
 
 # Preflight every destination before changing the current generation.
 for product in agents claude; do
@@ -333,6 +428,8 @@ for product in agents claude; do
             else
                 printf '%s\n' "warning: catalog $CATALOG_ID skill $effective_name skipped; destination exists: $destination" >&2
             fi
+        else
+            : >"$EXPOSURE_PLAN/$product/$effective_name.create" || die "cannot stage exposure plan"
         fi
     done
 done
@@ -344,13 +441,16 @@ NEXT_LINK=$INSTALL_ROOT/.current.$$
 ln -s "generations/$GENERATION_ID" "$NEXT_LINK" || die "cannot stage current generation link"
 if [ -e "$CURRENT_TARGET" ] || [ -L "$CURRENT_TARGET" ]; then
     [ -L "$CURRENT_TARGET" ] || die "catalog current view is not an owned directory link"
+    PREVIOUS_CURRENT_LINK=$(readlink "$CURRENT_TARGET") || die "cannot read catalog current view"
+    HAD_PREVIOUS_GENERATION=1
+else
+    PREVIOUS_CURRENT_LINK=
+    HAD_PREVIOUS_GENERATION=0
 fi
+TRANSACTION_ACTIVE=1
 # Plain POSIX mv follows a destination symlink to a directory. Use each supported platform's
 # no-follow form so replacement changes the link itself and never writes inside an immutable view.
-case $(uname -s) in
-    Darwin) mv -f -h "$NEXT_LINK" "$CURRENT_TARGET" || die "cannot activate generated view" ;;
-    *) mv -f -T "$NEXT_LINK" "$CURRENT_TARGET" || die "cannot activate generated view" ;;
-esac
+replace_link "$NEXT_LINK" "$CURRENT_TARGET" || die "cannot activate generated view"
 
 for product in agents claude; do
     case $product in
@@ -376,26 +476,22 @@ for product in agents claude; do
     done
     for generated_skill in "$CURRENT_TARGET"/*; do
         effective_name=${generated_skill##*/}
+        [ -f "$EXPOSURE_PLAN/$product/$effective_name.create" ] || continue
         destination=$product_root/$effective_name
         owner_file=$INSTALL_ROOT/ownership/$product/$effective_name.owner
         expected_target=$CURRENT_TARGET/$effective_name
-        if [ -e "$destination" ] || [ -L "$destination" ]; then
-            if [ -f "$owner_file" ] && [ -L "$destination" ] && [ "$(readlink "$destination")" = "$expected_target" ]; then
-                continue
-            fi
-            continue
-        fi
-        printf '%s\n' "$expected_target" >"$owner_file"
+        printf '%s/%s\n' "$product" "$effective_name" >>"$CREATED_EXPOSURES" || die "cannot record exposure transaction"
         # symlink(2) is an atomic no-clobber operation at the final destination. A temporary link
         # followed by mv could overwrite a file that appeared after the collision preflight.
         if ! ln -s "$expected_target" "$destination"; then
-            rm -f "$owner_file"
             die "cannot expose skill $effective_name"
         fi
+        printf '%s\n' "$expected_target" >"$owner_file" || die "cannot record ownership for skill $effective_name"
     done
 done
 
 if [ -n "${CANDIDATE_WORKTREE:-}" ]; then
     git -C "$MANAGED_REPO" reset --quiet --hard "$REMOTE_HEAD" >"$WORK_ROOT/reset.log" 2>&1 || die "installed view is valid but managed clone could not advance"
 fi
+TRANSACTION_ACTIVE=0
 printf '%s\n' "Installed catalog $CATALOG_ID as instance $INSTANCE_KEY with prefix '$PREFIX'."
