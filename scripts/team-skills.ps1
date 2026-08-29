@@ -445,11 +445,18 @@ function Invoke-CatalogUpdate([string]$InstanceKey) {
                 $updateFailed = $true
                 continue
             }
-            $childOutput = @(& $powerShellExecutable -NoLogo -NoProfile -NonInteractive `
-                -ExecutionPolicy Bypass -File $ScriptPath update-prefix $InstanceKey $installedKey 2>&1)
-            $childExitCode = $LASTEXITCODE
+            $savedPreference = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                $childOutput = @(& $powerShellExecutable -NoLogo -NoProfile -NonInteractive `
+                    -ExecutionPolicy Bypass -File $ScriptPath update-prefix $InstanceKey $installedKey 2>&1)
+                $childExitCode = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $savedPreference
+            }
             foreach ($childLine in $childOutput) {
-                Write-UpdateDiagnostic $childLine.ToString()
+                Write-UpdateDiagnostic ($childLine.ToString())
             }
             if ($childExitCode -ne 0) { $updateFailed = $true }
         }

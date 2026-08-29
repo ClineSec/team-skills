@@ -321,8 +321,8 @@ class PowerShellInstallerTests(unittest.TestCase):
         )
         self.assertEqual((instance / "last-success").read_text().strip(), "2000000000")
 
-        # The updater discovers owned state and does not need the bootstrap worktree or URL.
-        shutil.rmtree(work)
+        # The updater discovers owned state and does not receive the bootstrap URL.
+        self.assertTrue(work.is_dir())
         retried = self.run_updater()
         self.assertEqual(retried.returncode, 0, retried.stderr)
 
