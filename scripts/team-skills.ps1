@@ -449,13 +449,11 @@ try {
                 continue
             }
             [System.IO.File]::WriteAllText($ownerFile, $expectedTarget + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
-            $linkTemp = Join-Path $productRoot (".team-skills-" + $generatedSkill.Name + "." + [guid]::NewGuid().ToString("N"))
             try {
-                New-DirectoryExposure $linkTemp $expectedTarget
-                Move-Item -LiteralPath $linkTemp -Destination $destination
+                # Creating the final junction/symlink is atomic and fails if a racing path exists.
+                New-DirectoryExposure $destination $expectedTarget
             }
             catch {
-                if (Test-PathEntry $linkTemp) { Remove-DirectoryExposure $linkTemp }
                 Remove-Item -Force -LiteralPath $ownerFile
                 Fail "cannot expose skill $($generatedSkill.Name)"
             }

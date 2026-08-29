@@ -239,6 +239,58 @@ class PosixInstallerTests(unittest.TestCase):
         install_root = next((self.state / "catalogs").iterdir()) / "installs" / "_default"
         self.assertEqual(list(install_root.glob(".current.*")), [])
 
+    def test_racing_unrelated_destination_is_not_overwritten(self) -> None:
+        work, origin = self.make_catalog("race", "# Known good")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        original = (self.agents / "common-skill" / "SKILL.md").read_bytes()
+
+        new_skill = work / "skills" / "new-skill"
+        new_skill.mkdir()
+        (new_skill / "SKILL.md").write_text(
+            "---\nname: new-skill\ndescription: A new fixture skill.\n---\n\n# New skill\n",
+            encoding="utf-8",
+        )
+        self.git("add", ".", cwd=work)
+        self.git("commit", "-m", "add a valid skill", cwd=work)
+        self.git("push", cwd=work)
+
+        command_bin = self.base / "racing command bin"
+        command_bin.mkdir()
+        real_ln = shutil.which("ln")
+        self.assertIsNotNone(real_ln)
+        ln_wrapper = command_bin / "ln"
+        ln_wrapper.write_text(
+            "#!/bin/sh\n"
+            "last=\n"
+            "for argument do last=$argument; done\n"
+            "case $last in\n"
+            "  */.agents/skills/new-skill)\n"
+            "    printf 'race winner\\n' >\"$last\"\n"
+            "    ;;\n"
+            "esac\n"
+            'exec "$TEAM_SKILLS_TEST_REAL_LN" "$@"\n',
+            encoding="utf-8",
+        )
+        ln_wrapper.chmod(0o755)
+        self.env["TEAM_SKILLS_TEST_REAL_LN"] = real_ln or ""
+        self.env["PATH"] = str(command_bin) + os.pathsep + self.env["PATH"]
+
+        failed = self.run_installer("install", origin)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("cannot expose skill new-skill", failed.stderr)
+        self.assertEqual((self.agents / "new-skill").read_bytes(), b"race winner\n")
+        self.assertEqual((self.agents / "common-skill" / "SKILL.md").read_bytes(), original)
+        ownership = (
+            next((self.state / "catalogs").iterdir())
+            / "installs"
+            / "_default"
+            / "ownership"
+            / "agents"
+            / "new-skill.owner"
+        )
+        self.assertFalse(ownership.exists())
+
     def test_clone_failure_does_not_print_credentials(self) -> None:
         secret_url = "file://fixture-user:fixture-password@/definitely/missing/catalog.git"
         result = self.run_installer("install", secret_url)

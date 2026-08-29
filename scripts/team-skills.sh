@@ -386,10 +386,10 @@ for product in agents claude; do
             continue
         fi
         printf '%s\n' "$expected_target" >"$owner_file"
-        link_tmp=$product_root/.team-skills-$effective_name-$$
-        ln -s "$expected_target" "$link_tmp" || die "cannot stage exposure for $effective_name"
-        if ! mv "$link_tmp" "$destination"; then
-            rm -f "$link_tmp" "$owner_file"
+        # symlink(2) is an atomic no-clobber operation at the final destination. A temporary link
+        # followed by mv could overwrite a file that appeared after the collision preflight.
+        if ! ln -s "$expected_target" "$destination"; then
+            rm -f "$owner_file"
             die "cannot expose skill $effective_name"
         fi
     done
