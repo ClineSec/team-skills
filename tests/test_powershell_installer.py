@@ -392,6 +392,33 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertIn("not removing changed path", removed.stderr)
         self.assertTrue(prefixed_exposure.exists())
 
+    def test_owned_state_reparse_substitution_fails_without_removal(self) -> None:
+        _, origin = self.make_catalog("owned-state-link", "# Owned state")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        instance = next((self.state / "catalogs").iterdir())
+        install_root = instance / "installs" / "_default"
+        relocated = self.base / "relocated install state"
+        install_root.rename(relocated)
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(install_root), str(relocated)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        before_hooks = {
+            product: (instance / "hooks" / f"{product}.owner").read_bytes()
+            for product in ("claude", "codex", "cursor")
+        }
+
+        refused = self.run_installer("remove", origin)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("installation view is not an owned directory", refused.stderr)
+        self.assertTrue((self.agents / "common-skill").exists())
+        self.assertTrue(relocated.is_dir())
+        for product, previous in before_hooks.items():
+            self.assertEqual((instance / "hooks" / f"{product}.owner").read_bytes(), previous)
+
     def test_invalid_update_retains_last_known_good_and_output_hides_credentials(self) -> None:
         work, origin = self.make_catalog("update", "# Known good")
         installed = self.run_installer("install", origin)

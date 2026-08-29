@@ -31,9 +31,10 @@ catalog isolation, credential-bearing origin values, and predictable session sta
 
 The main controls are origin-only fetches with prompting disabled, per-catalog locks and throttle
 stamps, exact pinned candidates across prefixes, fast-forward-only history, ordinary-file and
-reparse-point checks, collision no-clobber semantics, immutable generations, atomic current-view
-activation, exact ownership records, staged hook merges, bounded atomic logs, and rollback after
-late failures.
+reparse-point checks at every catalog-owned directory boundary, collision no-clobber semantics,
+immutable generations, atomic current-view activation, exact ownership records, staged hook
+merges, bounded atomic logs with UTF-8-safe truncation, and rollback after late failures. A future
+success timestamp is treated as invalid throttle evidence rather than suppressing updates.
 
 ## Accepted and rejected cases
 
@@ -42,10 +43,10 @@ paths; same-history mirror origins; concurrent session starts; foreign hook entr
 collisions; and dead well-formed locks after the stale interval.
 
 Rejected without mutation include relative, filesystem-root, non-normalized POSIX, symlinked or
-reparse-point override targets; malformed or unsupported JSON; duplicate owned entries; changed
-owned commands; linked canonical content; missing or malformed lifecycle files; invalid catalog
-identity or names; credential-bearing fetch failures; unexpected lock contents; and non-fast-
-forward, downgrade, or unrelated history.
+reparse-point override targets or catalog-owned state; malformed or unsupported JSON; duplicate
+owned entries; changed owned commands; linked canonical content; missing or malformed lifecycle
+files; invalid catalog identity or names; credential-bearing fetch failures; future throttle
+timestamps; unexpected lock contents; and non-fast-forward, downgrade, or unrelated history.
 
 ## Residual risks and ownership
 

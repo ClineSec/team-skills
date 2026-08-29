@@ -696,6 +696,40 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must not be a symlink", result.stderr)
 
+    def test_owned_state_symlink_substitutions_fail_without_removal(self) -> None:
+        _, origin = self.make_catalog("owned-state-link", "# Owned state")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        instance = self.instance_root()
+        install_root = instance / "installs" / "_default"
+        relocated = self.base / "relocated install state"
+        install_root.rename(relocated)
+        install_root.symlink_to(relocated, target_is_directory=True)
+        before_hooks = {
+            product: (instance / "hooks" / f"{product}.owner").read_bytes()
+            for product in ("claude", "codex", "cursor")
+        }
+
+        refused = self.run_installer("remove", origin)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("installation view is not an owned directory", refused.stderr)
+        self.assertTrue((self.agents / "common-skill").is_symlink())
+        self.assertTrue(relocated.is_dir())
+        for product, previous in before_hooks.items():
+            self.assertEqual((instance / "hooks" / f"{product}.owner").read_bytes(), previous)
+
+    def test_future_success_stamp_does_not_suppress_update(self) -> None:
+        _, origin = self.make_catalog("future-stamp", "# Initial")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = self.instance_root()
+        (instance / "last-success").write_text("2000000100\n", encoding="utf-8")
+        self.git("remote", "set-url", "origin", str(self.base / "missing origin"), cwd=instance / "repo")
+        self.env["TEAM_SKILLS_NOW"] = "2000000000"
+
+        attempted = self.run_updater()
+        self.assertNotEqual(attempted.returncode, 0)
+        self.assertIn("unable to fetch the managed catalog origin", attempted.stderr)
+
     def test_late_remove_failure_restores_committed_hook_edits(self) -> None:
         _, origin = self.make_catalog("remove-rollback", "# Remove rollback")
         self.assertEqual(self.run_installer("install", origin).returncode, 0)
@@ -927,8 +961,7 @@ class PosixInstallerTests(unittest.TestCase):
             'if [ "$ACTION" = update-instance ]; then\n'
             "    sleep 3\n"
             "    printf 'detached-marker:' >&2\n"
-            "    head -c 70000 /dev/zero | tr '\\000' x >&2\n"
-            "    printf '\\n' >&2\n"
+            "    awk 'BEGIN { for (i = 0; i < 40000; i++) printf \"é\"; print \"\" }' >&2\n"
             "    run_catalog_update"
         )
         self.assertIn(needle, source)

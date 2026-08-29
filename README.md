@@ -181,10 +181,11 @@ fast-forward.
 The last hook-launched diagnostic for a catalog is written atomically to
 `catalogs/<instance-key>/last-update.log` below the state root. Origin values and Git clone/fetch
 diagnostics are suppressed so credential-bearing remotes are not printed. The log retains at most
-the final 64 KiB from the latest attempt. A failed fetch or invalid candidate leaves existing skills
-active and is retried after the next eligible session start. The manual `update-all` action is also
-available for diagnosis; it attempts every catalog even when one fails and returns nonzero if any
-eligible update fails.
+the final 64 KiB from the latest attempt without splitting a UTF-8 sequence. A failed fetch,
+invalid candidate, substituted catalog-owned directory, or future-dated throttle stamp leaves
+existing skills active and is retried after the next eligible session start. The manual
+`update-all` action is also available for diagnosis; it attempts every catalog even when one fails
+and returns nonzero if any eligible update fails.
 
 ## Curate and validate a fork
 

@@ -97,6 +97,27 @@ function Test-ReparsePoint([System.IO.FileSystemInfo]$Item) {
     return [bool]($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }
 
+function Assert-OwnedDirectory([string]$Path, [string]$Label) {
+    if (-not (Test-PathEntry $Path)) { return }
+    $item = Get-Item -Force -LiteralPath $Path
+    if (-not ($item -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $item)) {
+        Fail "$Label is not an owned directory"
+    }
+}
+
+function Assert-InstanceLayout([string]$InstanceRoot) {
+    Assert-OwnedDirectory $InstanceRoot "catalog instance state"
+    $repo = Join-Path $InstanceRoot "repo"
+    Assert-OwnedDirectory $repo "managed catalog clone"
+    $gitDirectory = Join-Path $repo ".git"
+    if (-not (Test-PathEntry $gitDirectory)) { Fail "managed catalog clone metadata is invalid" }
+    $gitItem = Get-Item -Force -LiteralPath $gitDirectory
+    if (-not ($gitItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $gitItem)) {
+        Fail "managed catalog clone metadata is invalid"
+    }
+    Assert-OwnedDirectory (Join-Path $InstanceRoot "installs") "catalog installation state"
+}
+
 function Invoke-Git([string[]]$Arguments, [ref]$Output) {
     $savedPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -783,7 +804,13 @@ function Invoke-CatalogUpdate([string]$InstanceKey) {
         Write-UpdateDiagnostic "error: invalid catalog instance key"
         return $false
     }
-    $instanceRoot = Join-Path (Join-Path $StateRoot "catalogs") $InstanceKey
+    $catalogsRoot = Join-Path $StateRoot "catalogs"
+    try { Assert-OwnedDirectory $catalogsRoot "catalog state root" }
+    catch {
+        Write-UpdateDiagnostic "error: catalog state root is invalid"
+        return $false
+    }
+    $instanceRoot = Join-Path $catalogsRoot $InstanceKey
     if (-not (Test-PathEntry $instanceRoot)) {
         Write-UpdateDiagnostic "error: catalog instance state is invalid"
         return $false
@@ -1121,6 +1148,8 @@ try {
     }
 
     $null = New-Item -ItemType Directory -Force -Path $StateRoot
+    Assert-OwnedDirectory (Join-Path $StateRoot "catalogs") "catalog state root"
+    Assert-OwnedDirectory (Join-Path $StateRoot "origins") "catalog origin index root"
     $WorkRoot = Join-Path $StateRoot (".operation." + [guid]::NewGuid().ToString("N"))
     $null = New-Item -ItemType Directory -Path $WorkRoot
 
@@ -1130,14 +1159,8 @@ try {
         $instanceKey = $RepositoryUrl
         if (-not (Test-InstanceKey $instanceKey)) { Fail "invalid catalog instance key" }
         $instanceRoot = Join-Path (Join-Path $StateRoot "catalogs") $instanceKey
-        $instanceItem = Get-Item -Force -LiteralPath $instanceRoot
-        if (-not ($instanceItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $instanceItem)) {
-            Fail "catalog instance state is invalid"
-        }
+        Assert-InstanceLayout $instanceRoot
         $ManagedRepo = Join-Path $instanceRoot "repo"
-        if (-not (Test-PathEntry (Join-Path $ManagedRepo ".git"))) {
-            Fail "catalog instance has no managed clone"
-        }
         $manifest = Read-Catalog $ManagedRepo
         if ($null -eq $manifest) {
             Fail "managed catalog clone is invalid; keeping the last known-good installation"
@@ -1169,9 +1192,7 @@ try {
         if ($instanceKey -cnotmatch '^[a-z0-9-]+$') { Fail "catalog origin index is invalid" }
         $instanceRoot = Join-Path (Join-Path $StateRoot "catalogs") $instanceKey
         $ManagedRepo = Join-Path $instanceRoot "repo"
-        if (-not (Test-PathEntry (Join-Path $ManagedRepo ".git"))) {
-            Fail "catalog origin index does not reference a managed clone"
-        }
+        Assert-InstanceLayout $instanceRoot
         $manifest = Read-Catalog $ManagedRepo
         if ($null -eq $manifest) {
             Fail "managed catalog clone is invalid; keeping the last known-good installation"
@@ -1210,6 +1231,18 @@ try {
         $installKey = if ($Prefix.Length -gt 0) { $Prefix } else { "_default" }
     }
     $installRoot = Join-Path (Join-Path $instanceRoot "installs") $installKey
+
+    if ($existingInstance) {
+        Assert-InstanceLayout $instanceRoot
+        if (Test-PathEntry $installRoot) {
+            Assert-OwnedDirectory $installRoot "catalog installation view"
+            Assert-OwnedDirectory (Join-Path $installRoot "generations") "catalog generation state"
+            $existingOwnership = Join-Path $installRoot "ownership"
+            Assert-OwnedDirectory $existingOwnership "catalog ownership state"
+            Assert-OwnedDirectory (Join-Path $existingOwnership "agents") "agents ownership state"
+            Assert-OwnedDirectory (Join-Path $existingOwnership "claude") "Claude ownership state"
+        }
+    }
 
     if ($Action -ceq "remove") {
         if (-not (Test-PathEntry $ManagedRepo)) { Fail "catalog instance is not installed" }
@@ -1336,6 +1369,11 @@ try {
     foreach ($product in @('agents', 'claude')) {
         $null = New-Item -ItemType Directory -Force -Path (Join-Path $ownershipRoot $product)
     }
+    Assert-OwnedDirectory $installRoot "catalog installation view"
+    Assert-OwnedDirectory $generationsRoot "catalog generation state"
+    Assert-OwnedDirectory $ownershipRoot "catalog ownership state"
+    Assert-OwnedDirectory (Join-Path $ownershipRoot "agents") "agents ownership state"
+    Assert-OwnedDirectory (Join-Path $ownershipRoot "claude") "Claude ownership state"
     $generationPath = Join-Path $generationsRoot $generationId
     $currentTarget = Join-Path $installRoot "current"
     $exposurePlan = Join-Path $WorkRoot "exposure-plan"

@@ -119,6 +119,28 @@ reject_unsafe_root "$CLAUDE_HOOKS_FILE" TEAM_SKILLS_CLAUDE_HOOKS_FILE
 reject_unsafe_root "$CODEX_HOOKS_FILE" TEAM_SKILLS_CODEX_HOOKS_FILE
 reject_unsafe_root "$CURSOR_HOOKS_FILE" TEAM_SKILLS_CURSOR_HOOKS_FILE
 
+owned_directory_is_safe() {
+    owned_path=$1
+    if [ -e "$owned_path" ] || [ -L "$owned_path" ]; then
+        [ -d "$owned_path" ] && [ ! -L "$owned_path" ]
+    fi
+}
+
+require_owned_directory() {
+    owned_path=$1
+    owned_label=$2
+    owned_directory_is_safe "$owned_path" || die "$owned_label is not an owned directory"
+}
+
+require_instance_layout() {
+    layout_root=$1
+    require_owned_directory "$layout_root" "catalog instance state"
+    require_owned_directory "$layout_root/repo" "managed catalog clone"
+    [ -d "$layout_root/repo/.git" ] && [ ! -L "$layout_root/repo/.git" ] || \
+        die "managed catalog clone metadata is invalid"
+    require_owned_directory "$layout_root/installs" "catalog installation state"
+}
+
 shell_quote() {
     printf "'"
     printf '%s' "$1" | sed "s/'/'\\\\''/g"
@@ -311,7 +333,12 @@ run_catalog_update() {
         printf '%s\n' "error: invalid catalog instance key" >&2
         return 1
     }
-    update_root=$STATE_ROOT/catalogs/$update_key
+    update_catalogs_root=$STATE_ROOT/catalogs
+    owned_directory_is_safe "$update_catalogs_root" || {
+        printf '%s\n' "error: catalog state root is invalid" >&2
+        return 1
+    }
+    update_root=$update_catalogs_root/$update_key
     [ -d "$update_root" ] && [ ! -L "$update_root" ] && [ -d "$update_root/repo/.git" ] || {
         printf '%s\n' "error: catalog instance state is invalid" >&2
         return 1
@@ -373,7 +400,7 @@ run_catalog_update() {
             *[!0-9]*|'') ;;
             *)
                 success_age=$((now_value - last_success))
-                if [ "$success_age" -lt "$throttle_value" ]; then
+                if [ "$success_age" -ge 0 ] && [ "$success_age" -lt "$throttle_value" ]; then
                     rm -rf "$UPDATE_LOCK"
                     trap - EXIT HUP INT TERM
                     return 0
@@ -457,6 +484,17 @@ if [ "$ACTION" = hook-worker ]; then
     if [ "$hook_bytes" -gt 65536 ]; then
         hook_bounded=$(mktemp "$hook_root/.last-update-bounded.XXXXXXXX") || exit "$hook_result"
         tail -c 65536 "$hook_temp" >"$hook_bounded" || exit "$hook_result"
+        # tail(1) counts bytes and can begin inside a UTF-8 continuation sequence. Drop at most
+        # three leading continuation bytes so diagnostics remain valid text without exceeding
+        # the byte cap. Invalid source diagnostics still remain bounded and inert.
+        while :; do
+            hook_first_byte=$(LC_ALL=C od -An -tu1 -N1 "$hook_bounded" 2>/dev/null | tr -d '[:space:]' || :)
+            case $hook_first_byte in *[!0-9]*|'') break ;; esac
+            [ "$hook_first_byte" -ge 128 ] && [ "$hook_first_byte" -le 191 ] || break
+            hook_trimmed=$(mktemp "$hook_root/.last-update-trimmed.XXXXXXXX") || exit "$hook_result"
+            tail -c +2 "$hook_bounded" >"$hook_trimmed" || exit "$hook_result"
+            mv "$hook_trimmed" "$hook_bounded" || exit "$hook_result"
+        done
         mv "$hook_bounded" "$hook_log" || exit "$hook_result"
         hook_bounded=
     else
@@ -488,7 +526,8 @@ fi
 if [ "$ACTION" = update-all ]; then
     overall_status=0
     catalogs_root=$STATE_ROOT/catalogs
-    [ -d "$catalogs_root" ] || exit 0
+    [ ! -e "$catalogs_root" ] && [ ! -L "$catalogs_root" ] && exit 0
+    owned_directory_is_safe "$catalogs_root" || die "catalog state root is invalid"
     for catalog_root in "$catalogs_root"/*; do
         [ -d "$catalog_root" ] && [ ! -L "$catalog_root" ] || continue
         catalog_key=${catalog_root##*/}
@@ -498,6 +537,8 @@ if [ "$ACTION" = update-all ]; then
 fi
 
 mkdir -p "$STATE_ROOT" || die "cannot create state root"
+require_owned_directory "$STATE_ROOT/catalogs" "catalog state root"
+require_owned_directory "$STATE_ROOT/origins" "catalog origin index root"
 WORK_ROOT=$(mktemp -d "$STATE_ROOT/.operation.XXXXXXXX") || die "cannot create temporary state"
 cleanup() {
     rollback_transaction
@@ -687,9 +728,8 @@ if [ "$ACTION" = update-prefix ]; then
     valid_instance_key "$INSTANCE_ARGUMENT" || die "invalid catalog instance key"
     INSTANCE_KEY=$INSTANCE_ARGUMENT
     INSTANCE_ROOT=$STATE_ROOT/catalogs/$INSTANCE_KEY
-    [ -d "$INSTANCE_ROOT" ] && [ ! -L "$INSTANCE_ROOT" ] || die "catalog instance state is invalid"
+    require_instance_layout "$INSTANCE_ROOT"
     MANAGED_REPO=$INSTANCE_ROOT/repo
-    [ -d "$MANAGED_REPO/.git" ] || die "catalog instance has no managed clone"
     if ! validate_catalog "$MANAGED_REPO"; then
         die "managed catalog clone is invalid; keeping the last known-good installation"
     fi
@@ -718,7 +758,7 @@ if [ "$ACTION" != update-prefix ] && [ -f "$ORIGIN_INDEX" ] && [ ! -L "$ORIGIN_I
     esac
     INSTANCE_ROOT=$STATE_ROOT/catalogs/$INSTANCE_KEY
     MANAGED_REPO=$INSTANCE_ROOT/repo
-    [ -d "$MANAGED_REPO/.git" ] || die "catalog origin index does not reference a managed clone"
+    require_instance_layout "$INSTANCE_ROOT"
     if ! validate_catalog "$MANAGED_REPO"; then
         die "managed catalog clone is invalid; keeping the last known-good installation"
     fi
@@ -759,6 +799,18 @@ else
     INSTALL_KEY=_default
 fi
 INSTALL_ROOT=$INSTANCE_ROOT/installs/$INSTALL_KEY
+
+if [ "$EXISTING_INSTANCE" -eq 1 ]; then
+    require_instance_layout "$INSTANCE_ROOT"
+    if [ -e "$INSTALL_ROOT" ] || [ -L "$INSTALL_ROOT" ]; then
+        [ -d "$INSTALL_ROOT" ] && [ ! -L "$INSTALL_ROOT" ] || \
+            die "catalog installation view is not an owned directory"
+        require_owned_directory "$INSTALL_ROOT/generations" "catalog generation state"
+        require_owned_directory "$INSTALL_ROOT/ownership" "catalog ownership state"
+        require_owned_directory "$INSTALL_ROOT/ownership/agents" "agents ownership state"
+        require_owned_directory "$INSTALL_ROOT/ownership/claude" "Claude ownership state"
+    fi
+fi
 
 if [ "$ACTION" = remove ]; then
     [ -d "$MANAGED_REPO" ] || die "catalog instance is not installed"
@@ -891,6 +943,11 @@ for skill_dir in "$SOURCE_ROOT/skills"/*; do
 done
 
 mkdir -p "$INSTALL_ROOT/generations" "$INSTALL_ROOT/ownership/agents" "$INSTALL_ROOT/ownership/claude"
+require_owned_directory "$INSTALL_ROOT" "catalog installation view"
+require_owned_directory "$INSTALL_ROOT/generations" "catalog generation state"
+require_owned_directory "$INSTALL_ROOT/ownership" "catalog ownership state"
+require_owned_directory "$INSTALL_ROOT/ownership/agents" "agents ownership state"
+require_owned_directory "$INSTALL_ROOT/ownership/claude" "Claude ownership state"
 GENERATION_PATH=$INSTALL_ROOT/generations/$GENERATION_ID
 CURRENT_TARGET=$INSTALL_ROOT/current
 EXPOSURE_PLAN=$WORK_ROOT/exposure-plan
