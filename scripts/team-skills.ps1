@@ -284,13 +284,20 @@ function Test-FileBytesEqual([string]$First, [string]$Second) {
     return $true
 }
 
+function Set-FileAccessSddl([string]$Path, [string]$Sddl) {
+    $sections = [System.Security.AccessControl.AccessControlSections]::Access
+    $accessControl = [System.Security.AccessControl.FileSecurity]::new()
+    $accessControl.SetSecurityDescriptorSddlForm($Sddl, $sections)
+    [System.IO.File]::SetAccessControl($Path, $accessControl)
+}
+
 function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigPath, [string]$Command) {
     $stageRoot = Join-Path (Join-Path $WorkRoot 'hooks') $Product
     $null = New-Item -ItemType Directory -Force -Path $stageRoot
     $beforePath = Join-Path $stageRoot 'before.json'
     $afterPath = Join-Path $stageRoot 'after.json'
     $existed = Test-PathEntry $ConfigPath
-    $accessControl = $null
+    $accessControlSddl = $null
     if ($existed) {
         $item = Get-Item -Force -LiteralPath $ConfigPath
         if (-not ($item -is [System.IO.FileInfo]) -or (Test-ReparsePoint $item)) {
@@ -299,6 +306,9 @@ function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigP
         try {
             $accessControl = [System.IO.File]::GetAccessControl(
                 $ConfigPath,
+                [System.Security.AccessControl.AccessControlSections]::Access
+            )
+            $accessControlSddl = $accessControl.GetSecurityDescriptorSddlForm(
                 [System.Security.AccessControl.AccessControlSections]::Access
             )
         }
@@ -318,7 +328,7 @@ function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigP
         BeforePath = $beforePath
         AfterPath = $afterPath
         Existed = $existed
-        AccessControl = $accessControl
+        AccessControlSddl = $accessControlSddl
         Committed = $false
     }
 }
@@ -383,9 +393,9 @@ function Rollback-HookChanges {
                     $parent = [System.IO.Path]::GetDirectoryName($stage.ConfigPath)
                     $temporary = Join-Path $parent ('.team-skills-rollback.' + [guid]::NewGuid().ToString('N'))
                     [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.BeforePath))
-                    [System.IO.File]::SetAccessControl($temporary, $stage.AccessControl)
+                    Set-FileAccessSddl $temporary $stage.AccessControlSddl
                     Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
-                    [System.IO.File]::SetAccessControl($stage.ConfigPath, $stage.AccessControl)
+                    Set-FileAccessSddl $stage.ConfigPath $stage.AccessControlSddl
                 }
                 else {
                     Remove-Item -Force -LiteralPath $stage.ConfigPath
@@ -422,13 +432,13 @@ function Commit-HookChanges {
         try {
             [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.AfterPath))
             if ($stage.Existed) {
-                [System.IO.File]::SetAccessControl($temporary, $stage.AccessControl)
+                Set-FileAccessSddl $temporary $stage.AccessControlSddl
                 Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
                 # Move-Item can re-inherit the parent DACL while replacing a file.
                 # Mark the byte replacement committed before restoring the captured
                 # DACL so an access-control failure participates in rollback.
                 $stage.Committed = $true
-                [System.IO.File]::SetAccessControl($stage.ConfigPath, $stage.AccessControl)
+                Set-FileAccessSddl $stage.ConfigPath $stage.AccessControlSddl
             }
             else {
                 Move-Item -LiteralPath $temporary -Destination $stage.ConfigPath
