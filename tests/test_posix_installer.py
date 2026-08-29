@@ -92,6 +92,20 @@ class PosixInstallerTests(unittest.TestCase):
             env=self.env,
         )
 
+    def run_updater(self, action: str = "update-all", *extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["sh", str(INSTALLER), action, *extra],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=self.env,
+        )
+
+    def instance_root(self) -> Path:
+        roots = list((self.state / "catalogs").iterdir())
+        self.assertEqual(len(roots), 1)
+        return roots[0]
+
     def test_two_origins_collision_prefix_idempotence_and_safe_remove(self) -> None:
         _, first_origin = self.make_catalog("first", "# First catalog")
         _, second_origin = self.make_catalog(
@@ -400,6 +414,111 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must be an absolute path", result.stderr)
         self.assertFalse((self.base / "relative").exists())
+
+    def test_url_free_update_reconciles_every_installed_prefix(self) -> None:
+        work, origin = self.make_catalog("all-prefixes", "# Initial")
+        first = self.run_installer("install", origin)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        prefixed = self.run_installer("install", origin, "--prefix", "fork")
+        self.assertEqual(prefixed.returncode, 0, prefixed.stderr)
+
+        skill_file = work / "skills" / "common-skill" / "SKILL.md"
+        skill_file.write_text(
+            skill_file.read_text(encoding="utf-8").replace("# Initial", "# Updated"),
+            encoding="utf-8",
+        )
+        self.git("add", ".", cwd=work)
+        self.git("commit", "-m", "update every view", cwd=work)
+        self.git("push", cwd=work)
+
+        self.env["TEAM_SKILLS_NOW"] = "2000000000"
+        updated = self.run_updater()
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertIn("# Updated", (self.agents / "common-skill" / "SKILL.md").read_text())
+        self.assertIn(
+            "# Updated", (self.claude / "fork-common-skill" / "SKILL.md").read_text()
+        )
+        self.assertEqual((self.instance_root() / "last-success").read_text().strip(), "2000000000")
+
+    def test_throttled_update_and_active_lock_do_not_fetch(self) -> None:
+        _, origin = self.make_catalog("throttle", "# Initial")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        instance = self.instance_root()
+        (instance / "last-success").write_text("2000000000\n", encoding="utf-8")
+        self.git("remote", "set-url", "origin", str(self.base / "missing origin"), cwd=instance / "repo")
+
+        self.env["TEAM_SKILLS_NOW"] = "2000000010"
+        throttled = self.run_updater()
+        self.assertEqual(throttled.returncode, 0, throttled.stderr)
+
+        (instance / "last-success").unlink()
+        lock = instance / "update.lock"
+        lock.mkdir()
+        (lock / "owner").write_text(f"{os.getpid()}\n2000000000\n", encoding="utf-8")
+        locked = self.run_updater()
+        self.assertEqual(locked.returncode, 0, locked.stderr)
+        self.assertTrue(lock.is_dir())
+
+    def test_stale_lock_recovers_conservatively(self) -> None:
+        _, origin = self.make_catalog("stale", "# Initial")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        instance = self.instance_root()
+        lock = instance / "update.lock"
+        lock.mkdir()
+        (lock / "owner").write_text("99999999\n100\n", encoding="utf-8")
+        self.env.update(
+            {
+                "TEAM_SKILLS_NOW": "10000",
+                "TEAM_SKILLS_STALE_LOCK_SECONDS": "1000",
+                "TEAM_SKILLS_THROTTLE_SECONDS": "0",
+            }
+        )
+
+        recovered = self.run_updater()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(lock.exists())
+        self.assertEqual((instance / "last-success").read_text().strip(), "10000")
+
+    def test_hook_masks_failure_and_credential_safe_log_retains_known_good(self) -> None:
+        _, origin = self.make_catalog("hook-failure", "# Known good")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        instance = self.instance_root()
+        secret_origin = "file://fixture-user:fixture-password@/definitely/missing/catalog.git"
+        self.git("remote", "set-url", "origin", secret_origin, cwd=instance / "repo")
+        original = (self.agents / "common-skill" / "SKILL.md").read_bytes()
+        self.env.update(
+            {
+                "TEAM_SKILLS_TEST_FOREGROUND": "1",
+                "TEAM_SKILLS_THROTTLE_SECONDS": "0",
+                "TEAM_SKILLS_NOW": "2000000000",
+            }
+        )
+
+        hooked = self.run_updater("hook", instance.name)
+        self.assertEqual(hooked.returncode, 0, hooked.stderr)
+        log = (instance / "last-update.log").read_text(encoding="utf-8")
+        self.assertIn("unable to fetch the managed catalog origin", log)
+        self.assertNotIn("fixture-user", log)
+        self.assertNotIn("fixture-password", log)
+        self.assertEqual((self.agents / "common-skill" / "SKILL.md").read_bytes(), original)
+
+    def test_changed_configured_origin_updates_without_bootstrap_url(self) -> None:
+        _, initial_origin = self.make_catalog("url-free-initial", "# Initial")
+        _, replacement_origin = self.make_catalog("url-free-replacement", "# Replacement")
+        installed = self.run_installer("install", initial_origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        instance = self.instance_root()
+        self.git("remote", "set-url", "origin", str(replacement_origin), cwd=instance / "repo")
+        self.env["TEAM_SKILLS_THROTTLE_SECONDS"] = "0"
+
+        updated = self.run_updater()
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertIn(
+            "# Replacement", (self.agents / "common-skill" / "SKILL.md").read_text()
+        )
 
 
 if __name__ == "__main__":

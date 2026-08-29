@@ -1,13 +1,15 @@
 #!/bin/sh
 set -eu
 
-# Team Skills milestone-2 lifecycle utility. Runtime dependencies: POSIX shell and Git.
+# Team Skills lifecycle utility. Runtime dependencies: POSIX shell and Git.
 
 PROGRAM=${0##*/}
 ACTION=install
 PREFIX_SET=0
 PREFIX=
 REPOSITORY_URL=
+INSTANCE_ARGUMENT=
+INSTALL_KEY_ARGUMENT=
 
 die() {
     printf '%s\n' "error: $*" >&2
@@ -18,23 +20,42 @@ usage() {
     cat >&2 <<EOF
 Usage: $PROGRAM install <repository-url> [--prefix <prefix>]
        $PROGRAM remove  <repository-url> [--prefix <prefix>]
+       $PROGRAM update-all
 
 Environment overrides (primarily for tests and managed environments):
   TEAM_SKILLS_STATE_ROOT   default: \${XDG_DATA_HOME:-\$HOME/.local/share}/team-skills
   TEAM_SKILLS_AGENTS_ROOT  default: \$HOME/.agents/skills
   TEAM_SKILLS_CLAUDE_ROOT  default: \$HOME/.claude/skills
+  TEAM_SKILLS_THROTTLE_SECONDS  default: 21600 (six hours)
 EOF
     exit 2
 }
 
-if [ "$#" -lt 2 ]; then
+if [ "$#" -lt 1 ]; then
     usage
 fi
 ACTION=$1
-REPOSITORY_URL=$2
-shift 2
 case $ACTION in
-    install|remove) ;;
+    install|remove)
+        [ "$#" -ge 2 ] || usage
+        REPOSITORY_URL=$2
+        shift 2
+        ;;
+    update-all)
+        [ "$#" -eq 1 ] || usage
+        shift
+        ;;
+    hook|update-instance)
+        [ "$#" -eq 2 ] || usage
+        INSTANCE_ARGUMENT=$2
+        shift 2
+        ;;
+    update-prefix)
+        [ "$#" -eq 3 ] || usage
+        INSTANCE_ARGUMENT=$2
+        INSTALL_KEY_ARGUMENT=$3
+        shift 3
+        ;;
     *) usage ;;
 esac
 while [ "$#" -gt 0 ]; do
@@ -48,7 +69,9 @@ while [ "$#" -gt 0 ]; do
         *) usage ;;
     esac
 done
-[ -n "$REPOSITORY_URL" ] || die "repository URL must not be blank"
+if [ "$ACTION" = install ] || [ "$ACTION" = remove ]; then
+    [ -n "$REPOSITORY_URL" ] || die "repository URL must not be blank"
+fi
 
 : "${HOME:?HOME must be set}"
 STATE_ROOT=${TEAM_SKILLS_STATE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/team-skills}
@@ -73,6 +96,151 @@ reject_unsafe_root() {
 reject_unsafe_root "$STATE_ROOT" TEAM_SKILLS_STATE_ROOT
 reject_unsafe_root "$AGENTS_ROOT" TEAM_SKILLS_AGENTS_ROOT
 reject_unsafe_root "$CLAUDE_ROOT" TEAM_SKILLS_CLAUDE_ROOT
+
+valid_instance_key() {
+    candidate_key=$1
+    case $candidate_key in
+        *[!a-z0-9-]*|'') return 1 ;;
+    esac
+    return 0
+}
+
+run_catalog_update() {
+    update_key=$1
+    valid_instance_key "$update_key" || {
+        printf '%s\n' "error: invalid catalog instance key" >&2
+        return 1
+    }
+    update_root=$STATE_ROOT/catalogs/$update_key
+    [ -d "$update_root" ] && [ ! -L "$update_root" ] && [ -d "$update_root/repo/.git" ] || {
+        printf '%s\n' "error: catalog instance state is invalid" >&2
+        return 1
+    }
+    lock_root=$update_root/update.lock
+    now_value=${TEAM_SKILLS_NOW:-$(date +%s)}
+    throttle_value=${TEAM_SKILLS_THROTTLE_SECONDS:-21600}
+    stale_value=${TEAM_SKILLS_STALE_LOCK_SECONDS:-3600}
+    case $now_value:$throttle_value:$stale_value in
+        *[!0-9:]*|:*|*::*|*:) printf '%s\n' "error: update timing override is invalid" >&2; return 1 ;;
+    esac
+
+    if ! mkdir "$lock_root" 2>/dev/null; then
+        [ -d "$lock_root" ] && [ ! -L "$lock_root" ] || {
+            printf '%s\n' "warning: unsafe update lock path; skipping catalog" >&2
+            return 0
+        }
+        lock_pid=$(sed -n '1p' "$lock_root/owner" 2>/dev/null || :)
+        lock_time=$(sed -n '2p' "$lock_root/owner" 2>/dev/null || :)
+        case $lock_pid:$lock_time in
+            *[!0-9:]*|:*|*::*|*:) return 0 ;;
+        esac
+        if kill -0 "$lock_pid" 2>/dev/null; then
+            return 0
+        fi
+        lock_age=$((now_value - lock_time))
+        [ "$lock_age" -ge "$stale_value" ] || return 0
+        stale_lock=$update_root/.stale-lock.$$
+        if ! mv "$lock_root" "$stale_lock" 2>/dev/null; then
+            return 0
+        fi
+        if ! mkdir "$lock_root" 2>/dev/null; then
+            mv "$stale_lock" "$lock_root" 2>/dev/null || :
+            return 0
+        fi
+        rm -rf "$stale_lock"
+    fi
+    printf '%s\n%s\n' "$$" "$now_value" >"$lock_root/owner" || {
+        rm -rf "$lock_root"
+        printf '%s\n' "error: cannot record update lock ownership" >&2
+        return 1
+    }
+    UPDATE_LOCK=$lock_root
+    trap 'rm -rf "$UPDATE_LOCK"' EXIT HUP INT TERM
+
+    success_stamp=$update_root/last-success
+    if [ -f "$success_stamp" ] && [ ! -L "$success_stamp" ]; then
+        last_success=$(sed -n '1p' "$success_stamp" 2>/dev/null || :)
+        case $last_success in
+            *[!0-9]*|'') ;;
+            *)
+                success_age=$((now_value - last_success))
+                if [ "$success_age" -lt "$throttle_value" ]; then
+                    rm -rf "$UPDATE_LOCK"
+                    trap - EXIT HUP INT TERM
+                    return 0
+                fi
+                ;;
+        esac
+    fi
+
+    update_failed=0
+    installs_root=$update_root/installs
+    [ -d "$installs_root" ] && [ ! -L "$installs_root" ] || update_failed=1
+    if [ "$update_failed" -eq 0 ]; then
+        found_install=0
+        for installed_view in "$installs_root"/*; do
+            [ -d "$installed_view" ] && [ ! -L "$installed_view" ] || continue
+            installed_key=${installed_view##*/}
+            if [ "$installed_key" != _default ]; then
+                if [ ${#installed_key} -gt 62 ] || ! printf '%s\n' "$installed_key" | LC_ALL=C grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$'; then
+                    printf '%s\n' "warning: invalid installed prefix state; skipping catalog" >&2
+                    update_failed=1
+                    continue
+                fi
+            fi
+            found_install=1
+            if ! GIT_TERMINAL_PROMPT=0 sh "$SCRIPT_PATH" update-prefix "$update_key" "$installed_key"; then
+                update_failed=1
+            fi
+        done
+        [ "$found_install" -eq 1 ] || update_failed=1
+    fi
+
+    if [ "$update_failed" -eq 0 ]; then
+        stamp_temp=$update_root/.last-success.$$
+        printf '%s\n' "$now_value" >"$stamp_temp" && mv "$stamp_temp" "$success_stamp" || update_failed=1
+    fi
+    rm -rf "$UPDATE_LOCK"
+    trap - EXIT HUP INT TERM
+    [ "$update_failed" -eq 0 ]
+}
+
+case $0 in
+    /*) SCRIPT_PATH=$0 ;;
+    *) SCRIPT_PATH=$(pwd)/$0 ;;
+esac
+
+if [ "$ACTION" = hook ]; then
+    valid_instance_key "$INSTANCE_ARGUMENT" || exit 0
+    hook_root=$STATE_ROOT/catalogs/$INSTANCE_ARGUMENT
+    [ -d "$hook_root" ] && [ ! -L "$hook_root" ] || exit 0
+    hook_log=$hook_root/last-update.log
+    if [ "${TEAM_SKILLS_TEST_FOREGROUND:-0}" = 1 ]; then
+        sh -c '"$1" update-instance "$2" >"$3.tmp.$$" 2>&1; result=$?; mv "$3.tmp.$$" "$3"; exit $result' \
+            team-skills-hook "$SCRIPT_PATH" "$INSTANCE_ARGUMENT" "$hook_log" || :
+    else
+        nohup sh -c '"$1" update-instance "$2" >"$3.tmp.$$" 2>&1; result=$?; mv "$3.tmp.$$" "$3"; exit $result' \
+            team-skills-hook "$SCRIPT_PATH" "$INSTANCE_ARGUMENT" "$hook_log" </dev/null >/dev/null 2>&1 &
+    fi
+    exit 0
+fi
+
+if [ "$ACTION" = update-instance ]; then
+    run_catalog_update "$INSTANCE_ARGUMENT"
+    exit $?
+fi
+
+if [ "$ACTION" = update-all ]; then
+    overall_status=0
+    catalogs_root=$STATE_ROOT/catalogs
+    [ -d "$catalogs_root" ] || exit 0
+    for catalog_root in "$catalogs_root"/*; do
+        [ -d "$catalog_root" ] && [ ! -L "$catalog_root" ] || continue
+        catalog_key=${catalog_root##*/}
+        if ! run_catalog_update "$catalog_key"; then overall_status=1; fi
+    done
+    exit "$overall_status"
+fi
 
 mkdir -p "$STATE_ROOT" || die "cannot create state root"
 WORK_ROOT=$(mktemp -d "$STATE_ROOT/.operation.XXXXXXXX") || die "cannot create temporary state"
@@ -242,11 +410,37 @@ validate_catalog() {
 
 # Exact bootstrap URL values normally become exact configured-origin values. This private index
 # lets reruns and removal find existing state without contacting a possibly unavailable remote.
-SUPPLIED_DIGEST=$(printf '%s' "$REPOSITORY_URL" | git hash-object --stdin) || die "cannot calculate catalog identity"
 ORIGIN_INDEX_ROOT=$STATE_ROOT/origins
-ORIGIN_INDEX=$ORIGIN_INDEX_ROOT/$SUPPLIED_DIGEST.instance
 EXISTING_INSTANCE=0
-if [ -f "$ORIGIN_INDEX" ] && [ ! -L "$ORIGIN_INDEX" ]; then
+if [ "$ACTION" = update-prefix ]; then
+    valid_instance_key "$INSTANCE_ARGUMENT" || die "invalid catalog instance key"
+    INSTANCE_KEY=$INSTANCE_ARGUMENT
+    INSTANCE_ROOT=$STATE_ROOT/catalogs/$INSTANCE_KEY
+    [ -d "$INSTANCE_ROOT" ] && [ ! -L "$INSTANCE_ROOT" ] || die "catalog instance state is invalid"
+    MANAGED_REPO=$INSTANCE_ROOT/repo
+    [ -d "$MANAGED_REPO/.git" ] || die "catalog instance has no managed clone"
+    if ! validate_catalog "$MANAGED_REPO"; then
+        die "managed catalog clone is invalid; keeping the last known-good installation"
+    fi
+    CONFIGURED_ORIGIN=$(git -C "$MANAGED_REPO" remote get-url origin 2>/dev/null) || die "managed clone has no configured origin"
+    [ -n "$CONFIGURED_ORIGIN" ] || die "managed clone origin must not be blank"
+    INSTANCE_CATALOG_ID=$CATALOG_ID
+    EXISTING_INSTANCE=1
+    PREFIX_SET=1
+    INSTALL_KEY=$INSTALL_KEY_ARGUMENT
+    if [ "$INSTALL_KEY" = _default ]; then
+        PREFIX=
+    else
+        valid_name "$INSTALL_KEY" || die "installed prefix state is invalid"
+        [ ${#INSTALL_KEY} -le 62 ] || die "installed prefix state is invalid"
+        PREFIX=$INSTALL_KEY
+    fi
+    [ -d "$INSTANCE_ROOT/installs/$INSTALL_KEY" ] && [ ! -L "$INSTANCE_ROOT/installs/$INSTALL_KEY" ] || die "installed prefix state is missing"
+else
+    SUPPLIED_DIGEST=$(printf '%s' "$REPOSITORY_URL" | git hash-object --stdin) || die "cannot calculate catalog identity"
+    ORIGIN_INDEX=$ORIGIN_INDEX_ROOT/$SUPPLIED_DIGEST.instance
+fi
+if [ "$ACTION" != update-prefix ] && [ -f "$ORIGIN_INDEX" ] && [ ! -L "$ORIGIN_INDEX" ]; then
     INSTANCE_KEY=$(sed -n '1p' "$ORIGIN_INDEX")
     case $INSTANCE_KEY in
         *[!a-z0-9-]*|'') die "catalog origin index is invalid" ;;
@@ -265,7 +459,7 @@ if [ -f "$ORIGIN_INDEX" ] && [ ! -L "$ORIGIN_INDEX" ]; then
     case $INSTANCE_DIGEST in *[!0-9a-f]*) die "catalog origin index identity mismatch" ;; esac
     INSTANCE_CATALOG_ID=$CATALOG_ID
     EXISTING_INSTANCE=1
-else
+elif [ "$ACTION" != update-prefix ]; then
     # Clone output is deliberately suppressed: Git may echo credential-bearing URLs on failure.
     BOOTSTRAP_CLONE=$WORK_ROOT/bootstrap
     if ! git clone --quiet --no-local -- "$REPOSITORY_URL" "$BOOTSTRAP_CLONE" >"$WORK_ROOT/clone.log" 2>&1; then
