@@ -473,9 +473,15 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertEqual(installed.returncode, 0, installed.stderr)
         self.assertIn("# Flexible JSON", (self.agents / "common-skill" / "SKILL.md").read_text())
 
-    def test_non_fast_forward_origin_change_is_rejected_with_remove_reinstall_recovery(self) -> None:
-        _, initial_origin = self.make_catalog("initial", "# Initial origin")
-        _, replacement_origin = self.make_catalog("replacement", "# Replacement origin")
+    def test_fast_forward_origin_change_is_rejected_with_remove_reinstall_recovery(self) -> None:
+        work, initial_origin = self.make_catalog("initial", "# Initial origin")
+        replacement_origin = self.base / "replacement origin.git"
+        self.git("clone", "--bare", str(initial_origin), str(replacement_origin))
+        skill = work / "skills" / "common-skill" / "SKILL.md"
+        skill.write_text(skill.read_text().replace("# Initial origin", "# Replacement origin"))
+        self.git("add", ".", cwd=work)
+        self.git("commit", "-m", "fast-forward replacement", cwd=work)
+        self.git("push", str(replacement_origin), "HEAD:main", cwd=work)
         installed = self.run_installer("install", initial_origin)
         self.assertEqual(installed.returncode, 0, installed.stderr)
 
@@ -486,7 +492,7 @@ class PosixInstallerTests(unittest.TestCase):
 
         reconciled = self.run_installer("install", initial_origin)
         self.assertNotEqual(reconciled.returncode, 0)
-        self.assertIn("history is not a fast-forward", reconciled.stderr)
+        self.assertIn("configured origin identity changed", reconciled.stderr)
         self.assertIn("# Initial origin", (self.agents / "common-skill" / "SKILL.md").read_text())
         self.assertEqual(list((self.state / "catalogs").iterdir()), instance_roots)
 
@@ -496,6 +502,21 @@ class PosixInstallerTests(unittest.TestCase):
         reinstalled = self.run_installer("install", replacement_origin)
         self.assertEqual(reinstalled.returncode, 0, reinstalled.stderr)
         self.assertIn("# Replacement origin", (self.agents / "common-skill" / "SKILL.md").read_text())
+
+    def test_remote_default_head_movement_is_followed_without_stale_tracking_ref(self) -> None:
+        work, origin = self.make_catalog("default-head", "# Initial branch")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        self.git("switch", "-c", "next", cwd=work)
+        skill = work / "skills" / "common-skill" / "SKILL.md"
+        skill.write_text(skill.read_text().replace("# Initial branch", "# New default branch"))
+        self.git("add", ".", cwd=work)
+        self.git("commit", "-m", "move default head", cwd=work)
+        self.git("push", "-u", "origin", "next", cwd=work)
+        self.git("symbolic-ref", "HEAD", "refs/heads/next", cwd=origin)
+
+        updated = self.run_installer("install", origin)
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertIn("# New default branch", (self.agents / "common-skill" / "SKILL.md").read_text())
 
     def test_invalid_fetched_lifecycle_runtime_cannot_advance_managed_clone(self) -> None:
         work, origin = self.make_catalog("runtime", "# Known good runtime")
@@ -764,7 +785,7 @@ class PosixInstallerTests(unittest.TestCase):
 
         attempted = self.run_updater()
         self.assertNotEqual(attempted.returncode, 0)
-        self.assertIn("unable to fetch the managed catalog origin", attempted.stderr)
+        self.assertIn("configured origin identity changed", attempted.stderr)
 
     def test_late_remove_failure_restores_committed_hook_edits(self) -> None:
         _, origin = self.make_catalog("remove-rollback", "# Remove rollback")
@@ -1059,7 +1080,7 @@ class PosixInstallerTests(unittest.TestCase):
 
         isolated = self.run_updater()
         self.assertNotEqual(isolated.returncode, 0)
-        self.assertIn("unable to fetch the managed catalog origin", isolated.stderr)
+        self.assertIn("configured origin identity changed", isolated.stderr)
         self.assertIn(
             "# Second updated", (self.claude / "second-common-skill" / "SKILL.md").read_text()
         )
@@ -1097,7 +1118,7 @@ class PosixInstallerTests(unittest.TestCase):
         hooked = self.run_updater("hook", instance.name)
         self.assertEqual(hooked.returncode, 0, hooked.stderr)
         log = (instance / "last-update.log").read_text(encoding="utf-8")
-        self.assertIn("unable to fetch the managed catalog origin", log)
+        self.assertIn("configured origin identity changed", log)
         self.assertNotIn("fixture-user", log)
         self.assertNotIn("fixture-password", log)
         self.assertEqual((self.agents / "common-skill" / "SKILL.md").read_bytes(), original)
@@ -1113,7 +1134,7 @@ class PosixInstallerTests(unittest.TestCase):
 
         updated = self.run_updater()
         self.assertNotEqual(updated.returncode, 0)
-        self.assertIn("history is not a fast-forward", updated.stderr)
+        self.assertIn("configured origin identity changed", updated.stderr)
         self.assertIn("# Initial", (self.agents / "common-skill" / "SKILL.md").read_text())
 
 

@@ -8,9 +8,10 @@ that a valid catalog author is benign.
 
 - The bootstrap script is executable code obtained and approved by the user. It may clone only the
   URL supplied for that initial operation.
-- The managed clone's configured `origin` is the sole later network authority. There is no baked
-  upstream or fallback. Origin text and Git diagnostics may contain credentials and are suppressed
-  from lifecycle output and hook logs.
+- The managed clone's configured `origin` is the sole later network authority, and its exact
+  installation-time digest remains bound to the instance key. There is no baked upstream or
+  fallback, and a later origin edit is rejected. Origin text and Git diagnostics may contain
+  credentials and are suppressed from lifecycle output and hook logs.
 - A fetched commit is only a candidate. It must fast-forward the installed revision and contain a
   complete, ordinary-path catalog plus all POSIX and Windows lifecycle files. Native syntax is
   checked before the managed clone advances.
@@ -29,8 +30,9 @@ configuration, a concurrent product start, a racing local process, and corrupted
 state. Protected assets are unrelated user skills and configuration, last-known-good generations,
 catalog isolation, credential-bearing origin values, and predictable session startup.
 
-The main controls are origin-only fetches with prompting disabled, per-catalog locks and throttle
-stamps, exact pinned candidates across prefixes, fast-forward-only history, ordinary-file and
+The main controls are instance-bound origin-only fetches of the remote's current `HEAD` with
+prompting disabled, per-catalog locks and throttle stamps, exact pinned candidates across prefixes,
+fast-forward-only history, ordinary-file and
 reparse-point checks at every catalog-owned directory boundary, collision no-clobber semantics,
 immutable generations, atomic current-view activation, exact ownership records, staged hook
 merges, bounded atomic logs with UTF-8-safe truncation, and rollback after late failures. A future
@@ -39,15 +41,16 @@ success timestamp is treated as invalid throttle evidence rather than suppressin
 ## Accepted and rejected cases
 
 Accepted cases include spaces, Unicode, quotes, and shell metacharacters in disposable absolute
-paths; same-history mirror origins; concurrent session starts; foreign hook entries; foreign skill
-collisions; and dead well-formed locks after the stale interval.
+paths; descendant remote default-branch movement; concurrent session starts; foreign hook entries;
+foreign skill collisions; and dead well-formed locks after the stale interval.
 
 Rejected without mutation include relative, filesystem-root, non-normalized POSIX, symlinked or
 reparse-point override targets or catalog-owned state; malformed, invalid-UTF-8, oversized, or
 excessively nested JSON; decoded duplicate or case-colliding object keys; duplicate owned entries;
 changed owned commands; linked canonical content; missing or malformed lifecycle files; invalid
-catalog identity or names; credential-bearing fetch failures; future throttle timestamps;
-unexpected lock contents; and non-fast-forward, downgrade, or unrelated history.
+catalog identity or names; any configured-origin identity change, including a fast-forward mirror;
+credential-bearing fetch failures; future throttle timestamps; unexpected lock contents; and
+non-fast-forward, downgrade, or unrelated history.
 
 ## Residual risks and ownership
 

@@ -254,7 +254,7 @@ class IntegratedMvpProof(unittest.TestCase):
         failed_open = self.run_runtime("hook", first_instance.name)
         self.assertEqual(failed_open.returncode, 0, failed_open.stderr)
         log = (first_instance / "last-update.log").read_text(encoding="utf-8-sig")
-        self.assertIn("unable to fetch the managed catalog origin", log)
+        self.assertIn("configured origin identity changed", log)
         self.assertNotIn("fixture-user", log)
         self.assertNotIn("fixture-password", log)
         self.assertIn(

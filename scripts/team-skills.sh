@@ -327,6 +327,25 @@ valid_instance_key() {
     return 0
 }
 
+configured_origin_matches_instance() {
+    origin_repo=$1
+    origin_instance_key=$2
+    origin_value=$(git -C "$origin_repo" remote get-url origin 2>/dev/null) || return 1
+    [ -n "$origin_value" ] || return 1
+    origin_digest=$(printf '%s' "$origin_value" | git hash-object --stdin 2>/dev/null) || return 1
+    case $origin_digest in
+        *[!0-9a-f]*|'') return 1 ;;
+    esac
+    { [ ${#origin_digest} -eq 40 ] || [ ${#origin_digest} -eq 64 ]; } || return 1
+    case $origin_instance_key in
+        *-"$origin_digest")
+            origin_catalog_id=${origin_instance_key%"-$origin_digest"}
+            valid_instance_key "$origin_catalog_id"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 run_catalog_update() {
     update_key=$1
     valid_instance_key "$update_key" || {
@@ -415,16 +434,19 @@ run_catalog_update() {
     update_candidate=
     if [ "$update_failed" -eq 0 ]; then
         update_repo=$update_root/repo
+        if ! configured_origin_matches_instance "$update_repo" "$update_key"; then
+            printf '%s\n' "error: managed catalog configured origin identity changed; restore it or remove and reinstall" >&2
+            update_failed=1
+        fi
+    fi
+    if [ "$update_failed" -eq 0 ]; then
         update_previous=$(git -C "$update_repo" rev-parse HEAD 2>/dev/null) || update_failed=1
-        if [ "$update_failed" -eq 0 ] && ! GIT_TERMINAL_PROMPT=0 git -C "$update_repo" fetch --quiet origin >/dev/null 2>&1; then
+        if [ "$update_failed" -eq 0 ] && ! GIT_TERMINAL_PROMPT=0 git -C "$update_repo" fetch --quiet origin HEAD >/dev/null 2>&1; then
             printf '%s\n' "error: unable to fetch the managed catalog origin" >&2
             update_failed=1
         fi
         if [ "$update_failed" -eq 0 ]; then
-            update_remote_head=$(git -C "$update_repo" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || update_failed=1
-        fi
-        if [ "$update_failed" -eq 0 ]; then
-            update_candidate=$(git -C "$update_repo" rev-parse --verify "$update_remote_head" 2>/dev/null) || update_failed=1
+            update_candidate=$(git -C "$update_repo" rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null) || update_failed=1
         fi
         if [ "$update_failed" -eq 0 ] && ! git -C "$update_repo" merge-base --is-ancestor "$update_previous" "$update_candidate" >/dev/null 2>&1; then
             printf '%s\n' "error: fetched catalog history is not a fast-forward; keeping the last known-good installation" >&2
@@ -719,6 +741,8 @@ if [ "$ACTION" = update-prefix ]; then
     fi
     CONFIGURED_ORIGIN=$(git -C "$MANAGED_REPO" remote get-url origin 2>/dev/null) || die "managed clone has no configured origin"
     [ -n "$CONFIGURED_ORIGIN" ] || die "managed clone origin must not be blank"
+    configured_origin_matches_instance "$MANAGED_REPO" "$INSTANCE_KEY" || \
+        die "managed catalog configured origin identity changed; restore it or remove and reinstall"
     INSTANCE_CATALOG_ID=$CATALOG_ID
     EXISTING_INSTANCE=1
     PREFIX_SET=1
@@ -754,6 +778,10 @@ if [ "$ACTION" != update-prefix ] && [ -f "$ORIGIN_INDEX" ] && [ ! -L "$ORIGIN_I
     case $INSTANCE_DIGEST in *[!0-9a-f]*) die "catalog origin index identity mismatch" ;; esac
     INSTANCE_CATALOG_ID=$CATALOG_ID
     EXISTING_INSTANCE=1
+    if [ "$ACTION" != remove ]; then
+        configured_origin_matches_instance "$MANAGED_REPO" "$INSTANCE_KEY" || \
+            die "managed catalog configured origin identity changed; restore it or remove and reinstall"
+    fi
 elif [ "$ACTION" != update-prefix ]; then
     # Clone output is deliberately suppressed: Git may echo credential-bearing URLs on failure.
     BOOTSTRAP_CLONE=$WORK_ROOT/bootstrap
@@ -859,15 +887,15 @@ else
     if [ -n "$CANDIDATE_ARGUMENT" ]; then
         case $CANDIDATE_ARGUMENT in *[!0-9a-f]*) die "pinned catalog candidate is invalid" ;; esac
         { [ ${#CANDIDATE_ARGUMENT} -eq 40 ] || [ ${#CANDIDATE_ARGUMENT} -eq 64 ]; } || die "pinned catalog candidate is invalid"
-        REMOTE_HEAD=$(git -C "$MANAGED_REPO" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || die "managed origin has no default branch"
-        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse --verify "$REMOTE_HEAD" 2>/dev/null) || die "managed origin default branch has no commit"
+        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse --verify "$CANDIDATE_ARGUMENT^{commit}" 2>/dev/null) || \
+            die "pinned catalog candidate is unavailable"
         [ "$CANDIDATE_REVISION" = "$CANDIDATE_ARGUMENT" ] || die "managed origin candidate changed during catalog update"
     else
-        if ! git -C "$MANAGED_REPO" fetch --quiet origin >"$WORK_ROOT/fetch.log" 2>&1; then
+        if ! git -C "$MANAGED_REPO" fetch --quiet origin HEAD >"$WORK_ROOT/fetch.log" 2>&1; then
             die "unable to fetch the managed catalog origin"
         fi
-        REMOTE_HEAD=$(git -C "$MANAGED_REPO" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null) || die "managed origin has no default branch"
-        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse --verify "$REMOTE_HEAD" 2>/dev/null) || die "managed origin default branch has no commit"
+        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null) || \
+            die "managed origin HEAD has no commit"
     fi
     if ! git -C "$MANAGED_REPO" merge-base --is-ancestor "$PREVIOUS_REPO_HEAD" "$CANDIDATE_REVISION" >/dev/null 2>&1; then
         die "fetched catalog history is not a fast-forward; keeping the last known-good installation"

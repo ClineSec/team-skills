@@ -39,15 +39,16 @@ state. During initial installation, the installer must:
 
 Different configured origins are independent catalogs even if their manifests match. The origin
 value is untrusted input: do not execute it, interpolate it into shell source, or expose embedded
-credentials in logs. Changing `origin` later intentionally changes where that existing clone
-fetches; it does not grant access to another catalog's state. The fetched default-branch commit
-must remain a fast-forward from the managed revision. Moving to an unrelated-history origin
-requires removing the old instance and installing the new origin explicitly.
+credentials in logs. Its initial digest remains bound to the instance key. A later `origin` change
+must fail closed even when the replacement is a fast-forward mirror; remove the old instance with
+its original bootstrap selector and install the new origin explicitly. Each fetch resolves the
+remote's current `HEAD` rather than trusting a possibly stale local `origin/HEAD`, and that commit
+must remain a fast-forward from the managed revision.
 
 Repository URLs are allowed only at initial bootstrap boundaries and in explanatory documentation.
 Every fetch, pull, status check, or recovery operation after cloning must derive its remote from
-the clone's currently configured `origin`. Operational code must not contain an AppSecThings,
-GitHub, or other fallback upstream.
+the clone's currently configured and instance-bound `origin`. Operational code must not contain an
+AppSecThings, GitHub, or other fallback upstream.
 
 The state-root layout and digest encoding are documented in `docs/operations.md`. They must remain
 deterministic, credential-safe, collision-resistant, and work on macOS, Linux, native Windows, and

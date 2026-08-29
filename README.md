@@ -53,8 +53,9 @@ fail without overwriting that file or exposing a partial installation.
 Each installed catalog has its own hook entry, lock, throttle, and managed clone. The hook command
 contains only the catalog instance key and the path to the lifecycle script in that clone; it does
 not contain or persist the bootstrap URL. Update work reads installed instances from owned state,
-fetches only each clone's configured `origin` with Git prompting disabled, and reconciles every
-installed prefix through the same validation and transactional activation used by `install`. One
+verifies each clone's configured `origin` still matches its installation identity, fetches only
+that remote's current `HEAD` with Git prompting disabled, and reconciles every installed prefix
+through the same validation and transactional activation used by `install`. One
 locked catalog attempt performs one fetch and pins the resulting exact commit for every prefix.
 The commit must be a fast-forward from the managed clone's current revision.
 
@@ -84,8 +85,8 @@ asynchronous Claude Code and Codex hooks and Cursor's fire-and-forget event.
 ## Multiple catalogs and prefixes
 
 Run the installer once for each catalog URL. Each exact initial URL receives deterministic,
-isolated clone and ownership state. A rerun fetches only the managed clone's currently configured
-`origin`, validates a complete candidate, and then reconciles its exposures.
+isolated clone and ownership state. A rerun fetches only the managed clone's instance-bound
+configured `origin`, validates a complete candidate, and then reconciles its exposures.
 
 The default prefix is read from `catalog.json` and is blank in this repository. With a blank
 prefix, an existing destination wins: the incoming skill is skipped, a warning is printed, the
@@ -173,10 +174,11 @@ and activation is atomic at the `current` link.
 A candidate is rejected before clone advancement unless it contains regular, non-symlinked copies
 of all three lifecycle files (`team-skills.sh`, `team-skills-json.awk`, and `team-skills.ps1`) and
 the native lifecycle script parses successfully. Rewritten, downgraded, or unrelated default-branch
-history is also rejected. To move an installation to an origin with unrelated history, remove each
-prefix using its original bootstrap selector, then install the new origin as a new instance. A
-same-history mirror may be configured as `origin` and continues only when its candidate is a
-fast-forward.
+history is also rejected. A remote may move its default `HEAD` to a descendant branch without
+manual local tracking-ref repair. To move an installation to any different origin, including a
+same-history mirror, remove each prefix using its original bootstrap selector, then install the new
+origin as a new instance. Direct edits to a managed clone's configured origin fail closed; removal
+remains available because it does not fetch.
 
 The last hook-launched diagnostic for a catalog is written atomically to
 `catalogs/<instance-key>/last-update.log` below the state root. Origin values and Git clone/fetch

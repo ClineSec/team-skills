@@ -58,6 +58,21 @@ function Test-PortableName([string]$Value, [int]$Maximum = 64) {
     return $Value.Length -le $Maximum -and $Value -cmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$'
 }
 
+function Test-ConfiguredOriginIdentity([string]$Repository, [string]$InstanceKey) {
+    try {
+        $origin = Get-GitValue @('-C', $Repository, 'remote', 'get-url', 'origin') "managed clone has no configured origin"
+        if ([string]::IsNullOrEmpty($origin)) { return $false }
+        $digest = Get-Sha256 $origin
+        $suffix = '-' + $digest
+        if (-not $InstanceKey.EndsWith($suffix, [System.StringComparison]::Ordinal)) {
+            return $false
+        }
+        $catalogId = $InstanceKey.Substring(0, $InstanceKey.Length - $suffix.Length)
+        return Test-InstanceKey $catalogId
+    }
+    catch { return $false }
+}
+
 function Get-FullSafeRoot([string]$Value, [string]$Label) {
     if ([string]::IsNullOrWhiteSpace($Value)) {
         Fail "$Label must not be blank"
@@ -946,13 +961,15 @@ function Invoke-CatalogUpdate([string]$InstanceKey) {
         $env:GIT_TERMINAL_PROMPT = "0"
         $managedRepo = Join-Path $instanceRoot 'repo'
         try {
+            if (-not (Test-ConfiguredOriginIdentity $managedRepo $InstanceKey)) {
+                Fail "managed catalog configured origin identity changed; restore it or remove and reinstall"
+            }
             $updatePrevious = Get-GitValue @('-C', $managedRepo, 'rev-parse', 'HEAD') "managed catalog clone has no Git revision"
             $captured = ""
-            if ((Invoke-Git @('-C', $managedRepo, 'fetch', '--quiet', 'origin') ([ref]$captured)) -ne 0) {
+            if ((Invoke-Git @('-C', $managedRepo, 'fetch', '--quiet', 'origin', 'HEAD') ([ref]$captured)) -ne 0) {
                 Fail "unable to fetch the managed catalog origin"
             }
-            $updateRemoteHead = Get-GitValue @('-C', $managedRepo, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD') "managed origin has no default branch"
-            $updateCandidate = Get-GitValue @('-C', $managedRepo, 'rev-parse', '--verify', $updateRemoteHead) "managed origin default branch has no commit"
+            $updateCandidate = Get-GitValue @('-C', $managedRepo, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}') "managed origin HEAD has no commit"
             $captured = ""
             if ((Invoke-Git @('-C', $managedRepo, 'merge-base', '--is-ancestor', $updatePrevious, $updateCandidate) ([ref]$captured)) -ne 0) {
                 Fail "fetched catalog history is not a fast-forward; keeping the last known-good installation"
@@ -1239,6 +1256,9 @@ try {
         }
         $configuredOrigin = Get-GitValue @('-C', $ManagedRepo, 'remote', 'get-url', 'origin') "managed clone has no configured origin"
         if ([string]::IsNullOrEmpty($configuredOrigin)) { Fail "managed clone origin must not be blank" }
+        if (-not (Test-ConfiguredOriginIdentity $ManagedRepo $instanceKey)) {
+            Fail "managed catalog configured origin identity changed; restore it or remove and reinstall"
+        }
         $instanceCatalogId = $manifest.catalog_id
         $existingInstance = $true
         $installKey = $Prefix
@@ -1279,6 +1299,9 @@ try {
         if ($instanceDigest -cnotmatch '^[0-9a-f]{64}$') { Fail "catalog origin index identity mismatch" }
         $instanceCatalogId = $manifest.catalog_id
         $existingInstance = $true
+        if ($Action -cne 'remove' -and -not (Test-ConfiguredOriginIdentity $ManagedRepo $instanceKey)) {
+            Fail "managed catalog configured origin identity changed; restore it or remove and reinstall"
+        }
     }
     elseif ($Action -cne "update-prefix") {
         $bootstrapClone = Join-Path $WorkRoot "bootstrap"
@@ -1377,8 +1400,7 @@ try {
             if ($CandidateRevision -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$') {
                 Fail "pinned catalog candidate is invalid"
             }
-            $remoteHead = Get-GitValue @('-C', $ManagedRepo, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD') "managed origin has no default branch"
-            $candidateRevisionResolved = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', '--verify', $remoteHead) "managed origin default branch has no commit"
+            $candidateRevisionResolved = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', '--verify', ($CandidateRevision + '^{commit}')) "pinned catalog candidate is unavailable"
             if ($candidateRevisionResolved -cne $CandidateRevision) {
                 Fail "managed origin candidate changed during catalog update"
             }
@@ -1386,11 +1408,10 @@ try {
         }
         else {
             $captured = ""
-            if ((Invoke-Git @('-C', $ManagedRepo, 'fetch', '--quiet', 'origin') ([ref]$captured)) -ne 0) {
+            if ((Invoke-Git @('-C', $ManagedRepo, 'fetch', '--quiet', 'origin', 'HEAD') ([ref]$captured)) -ne 0) {
                 Fail "unable to fetch the managed catalog origin"
             }
-            $remoteHead = Get-GitValue @('-C', $ManagedRepo, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD') "managed origin has no default branch"
-            $candidateRevision = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', '--verify', $remoteHead) "managed origin default branch has no commit"
+            $candidateRevision = Get-GitValue @('-C', $ManagedRepo, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}') "managed origin HEAD has no commit"
         }
         $captured = ""
         if ((Invoke-Git @('-C', $ManagedRepo, 'merge-base', '--is-ancestor', $script:PreviousRepoHead, $candidateRevision) ([ref]$captured)) -ne 0) {
