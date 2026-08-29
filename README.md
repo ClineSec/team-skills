@@ -37,15 +37,47 @@ sh scripts/team-skills.sh install "$(git remote get-url origin)"
 .\scripts\team-skills.ps1 install (git remote get-url origin)
 ```
 
-The installer creates a private managed clone and exposes its skills in both user-global discovery
-locations:
+The installer creates a private managed clone, exposes its skills in both user-global discovery
+locations, and structurally registers one catalog-owned session updater in each supported product:
 
 - `~/.agents/skills` for Codex and Cursor;
 - `~/.claude/skills` for Claude Code and Cursor.
 
 POSIX systems use directory symlinks. Native Windows uses directory junctions, which require no
-administrator or Developer Mode access. The scripts do not install runtimes, modify product hooks,
-or change other product configuration.
+administrator or Developer Mode access. Hook registration preserves unrelated JSON keys, events,
+handlers, and catalog entries. An existing malformed or unsupported hook file makes installation
+fail without overwriting that file or exposing a partial installation.
+
+## Automatic updates at session start
+
+Each installed catalog has its own hook entry, lock, throttle, and managed clone. The hook command
+contains only the catalog instance key and the path to the lifecycle script in that clone; it does
+not contain or persist the bootstrap URL. Update work reads installed instances from owned state,
+fetches only each clone's configured `origin` with Git prompting disabled, and reconciles every
+installed prefix through the same validation and transactional activation used by `install`.
+
+| Product | User configuration | Installed event |
+| --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` | asynchronous `SessionStart`, matcher `startup\|clear` |
+| Codex | `~/.codex/hooks.json` (`$CODEX_HOME/hooks.json` when set) | async `SessionStart`, `startup\|clear` |
+| Cursor | `~/.cursor/hooks.json` | `sessionStart` only |
+
+Claude Code and Codex updates run for a new session and after `/clear`, not for resume or compact.
+Codex requires the user to review and trust a non-managed hook before it will run; a newly installed
+or changed Team Skills hook can therefore be skipped until accepted in Codex. Cursor defines
+`sessionStart` as creation of a new composer conversation and runs it fire-and-forget. Team Skills
+does not install Cursor's separate `workspaceOpen` event. Cursor user-level hooks are local-only and
+are not available in Cursor cloud agents.
+
+The default throttle is six hours per catalog, measured from the last completely successful update.
+An update skipped by that throttle or by an already-held catalog lock does no network fetch and
+returns success. The hook launcher returns promptly, masks updater failure from product startup,
+and starts at most one detached, one-shot updater attempt per event; there is no resident process,
+daemon, cron job, or tool wrapper.
+
+Updates are deliberately not guaranteed to finish before a product's initial skill scan. A newly
+fetched skill may first be visible in the next session. This is especially relevant to the
+asynchronous Claude Code and Codex hooks and Cursor's fire-and-forget event.
 
 ## Multiple catalogs and prefixes
 
@@ -94,8 +126,11 @@ sh scripts/team-skills.sh remove REPOSITORY-URL --prefix acme
 
 Removal deletes an exposure only when its ownership record and link target both still match. A
 changed or user-replaced path is retained with a warning. Other prefixes, catalogs, user skills,
-and product configuration are outside that removal boundary. Removing the final prefix also
-removes that catalog's managed clone and origin index.
+and foreign product configuration are outside that removal boundary. Removing a non-final prefix
+keeps the catalog updater. Removing the final prefix removes only hook entries whose recorded
+configuration path and exact command still prove catalog ownership, then removes that catalog's
+managed clone, hook ownership state, and origin index. If a catalog-owned hook was edited, removal
+refuses safely so the installation can be inspected and retried.
 
 ## State and failure behavior
 
@@ -106,16 +141,23 @@ defaults to `%LOCALAPPDATA%\team-skills` (or `%USERPROFILE%\.local\share\team-sk
 ```text
 origins/<initial-url-digest>.instance
 catalogs/<catalog-id>-<origin-digest>/
-├── repo/                         managed Git clone
+├── repo/                         managed Git clone and hook runtime
+├── hooks/{claude,codex,cursor}.owner
+├── last-success                  successful-update throttle timestamp
+├── last-update.log               most recent hook-launched diagnostic
+├── update.lock/                  present only during an update attempt
 └── installs/<prefix-or-default>/
     ├── current                   active generated view link/junction
     ├── generations/              validated immutable views
     └── ownership/{agents,claude}/
 ```
 
-The environment variables `TEAM_SKILLS_STATE_ROOT`, `TEAM_SKILLS_AGENTS_ROOT`, and
-`TEAM_SKILLS_CLAUDE_ROOT` override these roots for managed environments and disposable tests. They
-must be absolute, non-root paths.
+The environment variables `TEAM_SKILLS_STATE_ROOT`, `TEAM_SKILLS_AGENTS_ROOT`,
+`TEAM_SKILLS_CLAUDE_ROOT`, `TEAM_SKILLS_CLAUDE_HOOKS_FILE`,
+`TEAM_SKILLS_CODEX_HOOKS_FILE`, and `TEAM_SKILLS_CURSOR_HOOKS_FILE` override these paths for managed
+environments and disposable tests. They must be absolute, non-root paths. The default throttle can
+be changed with `TEAM_SKILLS_THROTTLE_SECONDS`; `TEAM_SKILLS_NOW` and
+`TEAM_SKILLS_STALE_LOCK_SECONDS` exist for deterministic testing and controlled test environments.
 
 Clone and fetch diagnostics are suppressed so credential-bearing URLs are not echoed. Malformed
 catalogs, invalid names, failed fetches, and failed generation do not replace the last known-good
@@ -126,13 +168,12 @@ failure, no partial catalog exposure remains. The racing or user-owned path is n
 Interrupted temporary work is removed during process cleanup; validated generations are immutable
 and activation is atomic at the `current` link.
 
-## What is not automatic yet
-
-Milestone 2 implements explicit install, reconcile-on-rerun, collision handling, prefixes, and
-safe removal. It does **not** install session-start hooks or run background updates. Until milestone
-3 adds noninteractive, throttled hook integration, fetching and reconciliation happen only when a
-user reruns `install`. Manual in-product verification in Claude Code, Codex, and Cursor also remains
-a later acceptance step.
+The last hook-launched diagnostic for a catalog is written atomically to
+`catalogs/<instance-key>/last-update.log` below the state root. Origin values and Git clone/fetch
+diagnostics are suppressed so credential-bearing remotes are not printed. A failed fetch or invalid
+candidate leaves existing skills active and is retried after the next eligible session start. The
+manual `update-all` action is also available for diagnosis; it attempts every catalog even when one
+fails and returns nonzero if any eligible update fails.
 
 ## Curate and validate a fork
 
@@ -155,4 +196,7 @@ The canonical format follows the primary documentation reviewed on 2026-08-29:
 - [Cursor Agent Skills](https://cursor.com/docs/skills)
 
 See [the catalog contract](docs/catalog-contract.md) for exact multi-catalog semantics and
-[the authoring guide](docs/skill-authoring.md) for the portable subset.
+[the authoring guide](docs/skill-authoring.md) for the portable subset. See
+[operations and troubleshooting](docs/operations.md) for lifecycle architecture and recovery, and
+[manual verification](docs/manual-verification.md) for disposable WSL and product checks that still
+require a human.
