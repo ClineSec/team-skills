@@ -798,31 +798,70 @@ class PosixInstallerTests(unittest.TestCase):
         installed_hooks = {path: path.read_bytes() for path in hook_paths}
         command_bin = self.base / "remove failure bin"
         command_bin.mkdir()
-        real_rm = shutil.which("rm")
-        self.assertIsNotNone(real_rm)
-        wrapper = command_bin / "rm"
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        wrapper = command_bin / "mv"
         wrapper.write_text(
             "#!/bin/sh\n"
-            "for argument do\n"
-            "  case $argument in */.agents/skills/common-skill) exit 73 ;; esac\n"
-            "done\n"
-            'exec "$TEAM_SKILLS_TEST_REAL_RM" "$@"\n',
+            "last=\n"
+            "for argument do last=$argument; done\n"
+            "case $last in */removed-instance) exit 73 ;; esac\n"
+            'exec "$TEAM_SKILLS_TEST_REAL_MV" "$@"\n',
             encoding="utf-8",
         )
         wrapper.chmod(0o755)
         original_path = self.env["PATH"]
         self.env.update({
             "PATH": str(command_bin) + os.pathsep + original_path,
-            "TEAM_SKILLS_TEST_REAL_RM": real_rm or "",
+            "TEAM_SKILLS_TEST_REAL_MV": real_mv or "",
         })
         failed = self.run_installer("remove", origin)
         self.assertNotEqual(failed.returncode, 0)
-        self.assertIn("cannot remove owned exposure", failed.stderr)
+        self.assertIn("cannot atomically stage catalog state removal", failed.stderr)
         for path in hook_paths:
             self.assertEqual(path.read_bytes(), installed_hooks[path])
+        self.assertTrue((self.agents / "common-skill").is_symlink())
+        self.assertTrue((self.claude / "common-skill").is_symlink())
         self.assertTrue(self.instance_root().is_dir())
 
         self.env["PATH"] = original_path
+        removed = self.run_installer("remove", origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+
+    def test_remove_rejects_linked_or_malformed_skill_ownership_before_mutation(self) -> None:
+        _, origin = self.make_catalog("remove-owner", "# Remove owner validation")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = self.instance_root()
+        owner = instance / "installs" / "_default" / "ownership" / "agents" / "common-skill.owner"
+        original_owner = owner.read_bytes()
+        hook_paths = (
+            self.home / ".claude" / "settings.json",
+            self.home / ".codex" / "hooks.json",
+            self.home / ".cursor" / "hooks.json",
+        )
+        installed_hooks = {path: path.read_bytes() for path in hook_paths}
+        foreign = self.base / "foreign ownership evidence"
+        foreign.write_bytes(original_owner)
+        owner.unlink()
+        owner.symlink_to(foreign)
+
+        refused = self.run_installer("remove", origin)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("agents skill ownership state is invalid", refused.stderr)
+        self.assertTrue((self.agents / "common-skill").is_symlink())
+        self.assertTrue((self.claude / "common-skill").is_symlink())
+        self.assertEqual(foreign.read_bytes(), original_owner)
+        for path in hook_paths:
+            self.assertEqual(path.read_bytes(), installed_hooks[path])
+
+        owner.unlink()
+        owner.write_bytes(original_owner + b"unexpected\n")
+        refused = self.run_installer("remove", origin)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("agents skill ownership state is invalid", refused.stderr)
+        self.assertTrue((self.agents / "common-skill").is_symlink())
+
+        owner.write_bytes(original_owner)
         removed = self.run_installer("remove", origin)
         self.assertEqual(removed.returncode, 0, removed.stderr)
 

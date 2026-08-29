@@ -113,12 +113,16 @@ visible only in the next session. Team Skills does not emit Claude Code's synchr
 Remove each installed prefix with the same bootstrap URL used to create its origin-index record.
 Removing one prefix leaves the instance and its single set of hooks in place while another prefix
 remains. On the final prefix, Team Skills stages removal of each exact catalog-owned hook entry,
-removes proven skill exposures, and only then removes instance state and its origin index.
+preflights every skill ownership record, removes proven skill exposures, and only then atomically
+stages instance state and removes its origin index. If a late removal step fails, unchanged
+exposures and hook files are restored; a path created concurrently is never overwritten.
 
 Removal does not delete foreign entries or another catalog's entries. It refuses malformed hook
 configuration, a changed owned command, a changed ownership record, or a changed configuration
-path. It also retains a skill destination whose link/junction target no longer matches its
-ownership record. Restore the expected owned entry or path from a trusted backup, then rerun
+path. Skill ownership entries must be ordinary files with the exact canonical target and name;
+linked, extra, or malformed entries stop removal before mutation. It also retains a skill
+destination whose link/junction target no longer matches its ownership record. Restore the
+expected owned entry or path from a trusted backup, then rerun
 `remove`; do not delete shared configuration files to force removal.
 
 ## Troubleshooting

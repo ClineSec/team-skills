@@ -35,7 +35,10 @@ prompting disabled, per-catalog locks and throttle stamps, exact pinned candidat
 fast-forward-only history, ordinary-file and
 reparse-point checks at every catalog-owned directory boundary, collision no-clobber semantics,
 immutable generations, atomic current-view activation, exact ownership records, staged hook
-merges, bounded atomic logs with UTF-8-safe truncation, and rollback after late failures. A future
+merges, bounded atomic logs with UTF-8-safe truncation, and rollback after late install or removal
+failures. Removal preflights every ownership entry as an ordinary, canonical file before changing
+hooks or exposures, then atomically stages catalog state so an interrupted operation can restore
+already-removed links without overwriting a racing user path. A future
 success timestamp is treated as invalid throttle evidence rather than suppressing updates.
 
 ## Accepted and rejected cases
@@ -47,8 +50,9 @@ foreign skill collisions; and dead well-formed locks after the stale interval.
 Rejected without mutation include relative, filesystem-root, non-normalized POSIX, symlinked or
 reparse-point override targets or catalog-owned state; malformed, invalid-UTF-8, oversized, or
 excessively nested JSON; decoded duplicate or case-colliding object keys; duplicate owned entries;
-changed owned commands; linked canonical content; missing or malformed lifecycle files; invalid
-catalog identity or names; any configured-origin identity change, including a fast-forward mirror;
+changed owned commands; linked canonical content; linked, malformed, or noncanonical skill
+ownership records; missing or malformed lifecycle files; invalid catalog identity or names; any
+configured-origin identity change, including a fast-forward mirror;
 credential-bearing fetch failures; future throttle timestamps; unexpected lock contents; and
 non-fast-forward, downgrade, or unrelated history.
 

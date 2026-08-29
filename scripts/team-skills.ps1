@@ -38,6 +38,13 @@ $script:PreviousRepoHead = $null
 $script:UpdateDiagnostics = [System.Collections.Generic.List[string]]::new()
 $script:HookStages = @()
 $script:HookChangesCommitted = $false
+$script:RemovalActive = $false
+$script:RemovedExposures = @()
+$script:RemovalStagedPath = $null
+$script:RemovalOriginalPath = $null
+$script:RemovalOriginRemoved = $false
+$script:RemovalOriginIndex = $null
+$script:RemovalInstanceKey = $null
 
 function Fail([string]$Message) {
     throw [System.InvalidOperationException]::new($Message)
@@ -732,6 +739,47 @@ function Test-OwnedExposure([string]$Path, [string]$ExpectedTarget) {
     return $actual -ceq $expected
 }
 
+function Test-ExactUtf8File([string]$Path, [string]$ExpectedText) {
+    if (-not (Test-PathEntry $Path)) { return $false }
+    $item = Get-Item -Force -LiteralPath $Path
+    if (-not ($item -is [System.IO.FileInfo]) -or (Test-ReparsePoint $item)) { return $false }
+    $actual = [System.IO.File]::ReadAllBytes($Path)
+    $expected = [System.Text.UTF8Encoding]::new($false).GetBytes($ExpectedText)
+    if ($actual.Length -ne $expected.Length) { return $false }
+    for ($index = 0; $index -lt $actual.Length; $index++) {
+        if ($actual[$index] -ne $expected[$index]) { return $false }
+    }
+    return $true
+}
+
+function Get-RemovalExposurePlan([string]$InstallRoot) {
+    $ownershipRoot = Join-Path $InstallRoot 'ownership'
+    foreach ($product in @('agents', 'claude')) {
+        $owners = Join-Path $ownershipRoot $product
+        foreach ($ownerItem in @(Get-ChildItem -Force -LiteralPath $owners)) {
+            if (-not ($ownerItem -is [System.IO.FileInfo]) -or (Test-ReparsePoint $ownerItem) -or
+                    -not $ownerItem.Name.EndsWith('.owner', [System.StringComparison]::Ordinal)) {
+                Fail "$product skill ownership state is invalid"
+            }
+            $effectiveName = $ownerItem.Name.Substring(0, $ownerItem.Name.Length - '.owner'.Length)
+            if (-not (Test-PortableName $effectiveName)) {
+                Fail "$product skill ownership state is invalid"
+            }
+            $expectedTarget = Join-Path (Join-Path $InstallRoot 'current') $effectiveName
+            if (-not (Test-ExactUtf8File $ownerItem.FullName ($expectedTarget + [Environment]::NewLine))) {
+                Fail "$product skill ownership state is invalid"
+            }
+            $productRoot = if ($product -ceq 'agents') { $AgentsRoot } else { $ClaudeRoot }
+            [PSCustomObject]@{
+                Product = $product
+                Name = $effectiveName
+                Path = Join-Path $productRoot $effectiveName
+                ExpectedTarget = $expectedTarget
+            }
+        }
+    }
+}
+
 function Activate-Generation([string]$InstallRoot, [string]$GenerationPath) {
     $current = Join-Path $InstallRoot "current"
     $next = Join-Path $InstallRoot (".current." + [guid]::NewGuid().ToString("N"))
@@ -1086,10 +1134,11 @@ function Invoke-HookLaunch([string]$InstanceKey) {
 }
 
 function Invoke-TransactionRollback {
+    $removalRollbackFailed = -not (Rollback-Removal)
     $hookRollbackFailed = -not (Rollback-HookChanges)
     if (-not $script:TransactionActive) {
-        if ($hookRollbackFailed) {
-            [Console]::Error.WriteLine("warning: installation rollback could not fully restore catalog-owned hook configuration")
+        if ($removalRollbackFailed -or $hookRollbackFailed) {
+            [Console]::Error.WriteLine("warning: removal rollback could not fully restore catalog-owned state")
         }
         return
     }
@@ -1162,6 +1211,50 @@ function Invoke-TransactionRollback {
     if ($rollbackFailed) {
         [Console]::Error.WriteLine("warning: installation rollback could not fully restore catalog-owned state")
     }
+}
+
+function Rollback-Removal {
+    if (-not $script:RemovalActive) { return $true }
+    $script:RemovalActive = $false
+    $rollbackSucceeded = $true
+
+    if ($null -ne $script:RemovalStagedPath -and $null -ne $script:RemovalOriginalPath -and
+            (Test-PathEntry $script:RemovalStagedPath)) {
+        if (-not (Test-PathEntry $script:RemovalOriginalPath)) {
+            try {
+                Move-Item -LiteralPath $script:RemovalStagedPath -Destination $script:RemovalOriginalPath
+            }
+            catch { $rollbackSucceeded = $false }
+        }
+        else {
+            $rollbackSucceeded = $false
+        }
+    }
+
+    if ($script:RemovalOriginRemoved -and -not (Test-PathEntry $script:RemovalOriginIndex)) {
+        try {
+            $parent = [System.IO.Path]::GetDirectoryName($script:RemovalOriginIndex)
+            $temporary = Join-Path $parent ('.removal-rollback.' + [guid]::NewGuid().ToString('N'))
+            [System.IO.File]::WriteAllText(
+                $temporary,
+                $script:RemovalInstanceKey + [Environment]::NewLine,
+                [System.Text.UTF8Encoding]::new($false)
+            )
+            Move-Item -LiteralPath $temporary -Destination $script:RemovalOriginIndex
+        }
+        catch { $rollbackSucceeded = $false }
+    }
+
+    foreach ($removed in $script:RemovedExposures) {
+        if (Test-OwnedExposure $removed.Path $removed.ExpectedTarget) { continue }
+        if ((Test-PathEntry $removed.Path) -or -not (Test-PathEntry $removed.ExpectedTarget)) {
+            $rollbackSucceeded = $false
+            continue
+        }
+        try { New-DirectoryExposure $removed.Path $removed.ExpectedTarget }
+        catch { $rollbackSucceeded = $false }
+    }
+    return $rollbackSucceeded
 }
 
 try {
@@ -1353,35 +1446,46 @@ try {
                     $_.FullName -cne $installRoot
             }
         ).Count -gt 0
+        $removalPlan = @(Get-RemovalExposurePlan $installRoot)
+        if (-not $remainingInstall -and -not (Test-ExactUtf8File $originIndex ($instanceKey + [Environment]::NewLine))) {
+            Fail "catalog origin index is invalid"
+        }
+        $script:RemovalActive = $true
+        $script:RemovalOriginIndex = $originIndex
+        $script:RemovalInstanceKey = $instanceKey
         if (-not $remainingInstall) {
             Prepare-HookRemoval $instanceRoot $instanceKey
             Commit-HookChanges
         }
-        foreach ($product in @('agents', 'claude')) {
-            $productRoot = if ($product -ceq 'agents') { $AgentsRoot } else { $ClaudeRoot }
-            $owners = Join-Path (Join-Path $installRoot "ownership") $product
-            if (-not (Test-PathEntry $owners)) { continue }
-            foreach ($ownerFile in @(Get-ChildItem -File -Filter "*.owner" -LiteralPath $owners)) {
-                $effectiveName = $ownerFile.BaseName
-                $destination = Join-Path $productRoot $effectiveName
-                $expectedTarget = ([System.IO.File]::ReadAllText($ownerFile.FullName)).Trim()
-                if (Test-OwnedExposure $destination $expectedTarget) {
-                    Remove-DirectoryExposure $destination
-                }
-                elseif (Test-PathEntry $destination) {
-                    [Console]::Error.WriteLine("warning: not removing changed path $destination")
-                }
+        foreach ($planned in $removalPlan) {
+            if (Test-OwnedExposure $planned.Path $planned.ExpectedTarget) {
+                $script:RemovedExposures += $planned
+                Remove-DirectoryExposure $planned.Path
+            }
+            elseif (Test-PathEntry $planned.Path) {
+                [Console]::Error.WriteLine("warning: not removing changed path $($planned.Path)")
             }
         }
-        Remove-Item -Recurse -Force -LiteralPath $installRoot
-        $installsRoot = Join-Path $instanceRoot "installs"
-        if ((Test-PathEntry $installsRoot) -and @(Get-ChildItem -Force -LiteralPath $installsRoot).Count -eq 0) {
-            if (-not $remainingInstall) { Finalize-HookOwnership $true }
-            Remove-Item -Recurse -Force -LiteralPath $instanceRoot
-            if ((Test-PathEntry $originIndex) -and ([System.IO.File]::ReadAllText($originIndex)).Trim() -ceq $instanceKey) {
-                Remove-Item -Force -LiteralPath $originIndex
-            }
+        if ($remainingInstall) {
+            $script:RemovalOriginalPath = $installRoot
+            $script:RemovalStagedPath = Join-Path $WorkRoot 'removed-install'
         }
+        else {
+            $script:RemovalOriginalPath = $instanceRoot
+            $script:RemovalStagedPath = Join-Path $WorkRoot 'removed-instance'
+        }
+        try {
+            Move-Item -LiteralPath $script:RemovalOriginalPath -Destination $script:RemovalStagedPath
+        }
+        catch {
+            Fail "cannot atomically stage catalog state removal"
+        }
+        if (-not $remainingInstall) {
+            $script:RemovalOriginRemoved = $true
+            Remove-Item -Force -LiteralPath $originIndex
+        }
+        $script:HookChangesCommitted = $false
+        $script:RemovalActive = $false
         Write-Output "Removed catalog $($manifest.catalog_id) prefix '$Prefix'."
         exit 0
     }

@@ -584,6 +584,7 @@ replace_link() {
 }
 
 rollback_transaction() {
+    rollback_removal || printf '%s\n' "warning: removal rollback could not fully restore catalog-owned state" >&2
     # Hook edits can commit before an uninstall touches exposures. Always roll them back on a
     # later failure, even though removal does not activate an installation transaction.
     rollback_hook_changes || printf '%s\n' "warning: installation rollback could not fully restore catalog-owned hook configuration" >&2
@@ -662,6 +663,82 @@ rollback_transaction() {
     if [ "$rollback_failed" -ne 0 ]; then
         printf '%s\n' "warning: installation rollback could not fully restore catalog-owned state" >&2
     fi
+}
+
+rollback_removal() {
+    [ "${REMOVAL_ACTIVE:-0}" -eq 1 ] || return 0
+    REMOVAL_ACTIVE=0
+    removal_rollback_failed=0
+
+    if [ -n "${REMOVAL_STAGED_PATH:-}" ] && [ -n "${REMOVAL_ORIGINAL_PATH:-}" ]; then
+        if { [ -e "$REMOVAL_STAGED_PATH" ] || [ -L "$REMOVAL_STAGED_PATH" ]; } && \
+                [ ! -e "$REMOVAL_ORIGINAL_PATH" ] && [ ! -L "$REMOVAL_ORIGINAL_PATH" ]; then
+            mv "$REMOVAL_STAGED_PATH" "$REMOVAL_ORIGINAL_PATH" || removal_rollback_failed=1
+        elif [ -e "$REMOVAL_STAGED_PATH" ] || [ -L "$REMOVAL_STAGED_PATH" ]; then
+            removal_rollback_failed=1
+        fi
+    fi
+
+    if [ "${REMOVAL_ORIGIN_REMOVED:-0}" -eq 1 ] && \
+            [ ! -e "$ORIGIN_INDEX" ] && [ ! -L "$ORIGIN_INDEX" ]; then
+        removal_index_temp=$ORIGIN_INDEX_ROOT/.removal-rollback.$$
+        if ! printf '%s\n' "$INSTANCE_KEY" >"$removal_index_temp" || \
+                ! mv "$removal_index_temp" "$ORIGIN_INDEX"; then
+            rm -f "$removal_index_temp" >/dev/null 2>&1 || :
+            removal_rollback_failed=1
+        fi
+    fi
+
+    if [ -f "${REMOVED_EXPOSURES:-}" ]; then
+        while IFS=/ read -r product effective_name; do
+            case $product in
+                agents) product_root=$AGENTS_ROOT ;;
+                claude) product_root=$CLAUDE_ROOT ;;
+                *) removal_rollback_failed=1; continue ;;
+            esac
+            destination=$product_root/$effective_name
+            expected_target=$INSTALL_ROOT/current/$effective_name
+            if [ -L "$destination" ] && [ "$(readlink "$destination")" = "$expected_target" ]; then
+                continue
+            fi
+            if [ -e "$destination" ] || [ -L "$destination" ] || [ ! -d "$expected_target" ]; then
+                removal_rollback_failed=1
+                continue
+            fi
+            ln -s "$expected_target" "$destination" || removal_rollback_failed=1
+        done <"$REMOVED_EXPOSURES"
+    fi
+    [ "$removal_rollback_failed" -eq 0 ]
+}
+
+prepare_removal_plan() {
+    REMOVAL_PLAN=$WORK_ROOT/removal-plan
+    REMOVAL_OWNER_EXPECTED=$WORK_ROOT/expected-owner
+    : >"$REMOVAL_PLAN"
+    for product in agents claude; do
+        owners=$INSTALL_ROOT/ownership/$product
+        for owner_entry in "$owners"/*; do
+            [ -e "$owner_entry" ] || [ -L "$owner_entry" ] || continue
+            owner_name=${owner_entry##*/}
+            case $owner_name in
+                *.owner) effective_name=${owner_name%.owner} ;;
+                *) die "$product skill ownership state is invalid" ;;
+            esac
+            valid_name "$effective_name" || die "$product skill ownership state is invalid"
+            [ -f "$owner_entry" ] && [ ! -L "$owner_entry" ] || \
+                die "$product skill ownership state is invalid"
+            expected_target=$INSTALL_ROOT/current/$effective_name
+            printf '%s\n' "$expected_target" >"$REMOVAL_OWNER_EXPECTED" || \
+                die "cannot validate $product skill ownership state"
+            cmp -s "$owner_entry" "$REMOVAL_OWNER_EXPECTED" || \
+                die "$product skill ownership state is invalid"
+            printf '%s/%s\n' "$product" "$effective_name" >>"$REMOVAL_PLAN" || \
+                die "cannot stage removal plan"
+        done
+        if find "$owners" -mindepth 1 -maxdepth 1 -name '.*' -print -quit | grep -q .; then
+            die "$product skill ownership state is invalid"
+        fi
+    done
 }
 
 valid_name() {
@@ -835,40 +912,52 @@ if [ "$ACTION" = remove ]; then
         [ -d "$installed_view" ] && [ ! -L "$installed_view" ] || continue
         [ "$installed_view" = "$INSTALL_ROOT" ] || remaining_install=1
     done
+    prepare_removal_plan
+    if [ "$remaining_install" -eq 0 ]; then
+        printf '%s\n' "$INSTANCE_KEY" >"$REMOVAL_OWNER_EXPECTED"
+        [ -f "$ORIGIN_INDEX" ] && [ ! -L "$ORIGIN_INDEX" ] && \
+            cmp -s "$ORIGIN_INDEX" "$REMOVAL_OWNER_EXPECTED" || \
+            die "catalog origin index is invalid"
+    fi
+    REMOVED_EXPOSURES=$WORK_ROOT/removed-exposures
+    : >"$REMOVED_EXPOSURES"
+    REMOVAL_ACTIVE=1
+    REMOVAL_ORIGIN_REMOVED=0
     if [ "$remaining_install" -eq 0 ]; then
         prepare_hook_removal
         commit_hook_changes
     fi
-    for product in agents claude; do
+    while IFS=/ read -r product effective_name; do
         case $product in
             agents) product_root=$AGENTS_ROOT ;;
             claude) product_root=$CLAUDE_ROOT ;;
+            *) die "skill ownership state is invalid" ;;
         esac
-        owners=$INSTALL_ROOT/ownership/$product
-        [ -d "$owners" ] || continue
-        for owner_file in "$owners"/*.owner; do
-            [ -f "$owner_file" ] || continue
-            effective_name=${owner_file##*/}
-            effective_name=${effective_name%.owner}
-            destination=$product_root/$effective_name
-            expected_target=$(sed -n '1p' "$owner_file")
-            if [ -L "$destination" ] && [ "$(readlink "$destination")" = "$expected_target" ]; then
-                rm "$destination" || die "cannot remove owned exposure $destination"
-            elif [ -e "$destination" ] || [ -L "$destination" ]; then
-                printf '%s\n' "warning: not removing changed path $destination" >&2
-            fi
-        done
-    done
-    rm -rf "$INSTALL_ROOT"
-    if [ -d "$INSTANCE_ROOT/installs" ] && [ -z "$(find "$INSTANCE_ROOT/installs" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-        [ "$remaining_install" -ne 0 ] || finalize_hook_ownership
-        rm -rf "$INSTANCE_ROOT"
-        if [ -f "$ORIGIN_INDEX" ] && [ "$(sed -n '1p' "$ORIGIN_INDEX")" = "$INSTANCE_KEY" ]; then
-            rm "$ORIGIN_INDEX"
+        destination=$product_root/$effective_name
+        expected_target=$INSTALL_ROOT/current/$effective_name
+        if [ -L "$destination" ] && [ "$(readlink "$destination")" = "$expected_target" ]; then
+            printf '%s/%s\n' "$product" "$effective_name" >>"$REMOVED_EXPOSURES" || \
+                die "cannot record removal transaction"
+            rm "$destination" || die "cannot remove owned exposure $destination"
+        elif [ -e "$destination" ] || [ -L "$destination" ]; then
+            printf '%s\n' "warning: not removing changed path $destination" >&2
         fi
-    elif [ "$remaining_install" -eq 0 ]; then
-        die "catalog installation state could not be removed after unregistering hooks"
+    done <"$REMOVAL_PLAN"
+    if [ "$remaining_install" -eq 0 ]; then
+        REMOVAL_ORIGINAL_PATH=$INSTANCE_ROOT
+        REMOVAL_STAGED_PATH=$WORK_ROOT/removed-instance
+    else
+        REMOVAL_ORIGINAL_PATH=$INSTALL_ROOT
+        REMOVAL_STAGED_PATH=$WORK_ROOT/removed-install
     fi
+    mv "$REMOVAL_ORIGINAL_PATH" "$REMOVAL_STAGED_PATH" || \
+        die "cannot atomically stage catalog state removal"
+    if [ "$remaining_install" -eq 0 ]; then
+        REMOVAL_ORIGIN_REMOVED=1
+        rm "$ORIGIN_INDEX" || die "cannot remove catalog origin index"
+    fi
+    HOOK_CHANGES_COMMITTED=0
+    REMOVAL_ACTIVE=0
     printf '%s\n' "Removed catalog $CATALOG_ID prefix '$PREFIX'."
     exit 0
 fi

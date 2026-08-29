@@ -629,6 +629,38 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertFalse((self.agents / "common-skill").exists())
         self.assertFalse((self.claude / "zz-race-skill").exists())
 
+    def test_remove_rejects_malformed_skill_ownership_before_mutation(self) -> None:
+        _, origin = self.make_catalog("remove-owner", "# Remove owner validation")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = next((self.state / "catalogs").iterdir())
+        owner = instance / "installs" / "_default" / "ownership" / "agents" / "common-skill.owner"
+        original_owner = owner.read_bytes()
+        hooks = {
+            path: path.read_bytes()
+            for path in (self.claude_hooks, self.codex_hooks, self.cursor_hooks)
+        }
+        owner.unlink()
+        owner.mkdir()
+
+        refused = self.run_installer("remove", origin)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("agents skill ownership state is invalid", refused.stderr)
+        self.assertTrue((self.agents / "common-skill").exists())
+        self.assertTrue((self.claude / "common-skill").exists())
+        for path, previous in hooks.items():
+            self.assertEqual(path.read_bytes(), previous)
+
+        owner.rmdir()
+        owner.write_bytes(original_owner + b"unexpected\r\n")
+        refused = self.run_installer("remove", origin)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("agents skill ownership state is invalid", refused.stderr)
+        self.assertTrue((self.agents / "common-skill").exists())
+
+        owner.write_bytes(original_owner)
+        removed = self.run_installer("remove", origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+
     def test_url_free_update_reconciles_all_prefixes_at_one_candidate(self) -> None:
         work, initial_origin = self.make_catalog("all-prefixes", "# Initial")
         self.assertEqual(self.run_installer("install", initial_origin).returncode, 0)
