@@ -381,7 +381,8 @@ try {
         if ($Prefix.Length -gt 0) {
             $skillFile = Join-Path $stagedSkill "SKILL.md"
             $text = Read-Utf8Text $skillFile
-            $rewritten = [System.Text.RegularExpressions.Regex]::Replace($text, '(?m)^name:[ \t]*[^\r\n]*$', "name: $effectiveName")
+            # Leave the original LF or CRLF delimiter byte-for-byte intact.
+            $rewritten = [System.Text.RegularExpressions.Regex]::Replace($text, '(?m)^name:[ \t]*[^\r\n]*(?=\r?$)', "name: $effectiveName")
             [System.IO.File]::WriteAllText($skillFile, $rewritten, [System.Text.UTF8Encoding]::new($false))
         }
         if (-not (Test-Skill $stagedSkill $effectiveName)) { Fail "generated skill failed validation: $effectiveName" }
