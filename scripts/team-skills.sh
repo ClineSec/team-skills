@@ -441,12 +441,12 @@ run_catalog_update() {
     fi
     if [ "$update_failed" -eq 0 ]; then
         update_previous=$(git -C "$update_repo" rev-parse HEAD 2>/dev/null) || update_failed=1
-        if [ "$update_failed" -eq 0 ] && ! GIT_TERMINAL_PROMPT=0 git -C "$update_repo" fetch --quiet origin HEAD >/dev/null 2>&1; then
+        if [ "$update_failed" -eq 0 ] && ! GIT_TERMINAL_PROMPT=0 git -C "$update_repo" fetch --quiet origin '+HEAD:refs/team-skills/candidate' >/dev/null 2>&1; then
             printf '%s\n' "error: unable to fetch the managed catalog origin" >&2
             update_failed=1
         fi
         if [ "$update_failed" -eq 0 ]; then
-            update_candidate=$(git -C "$update_repo" rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null) || update_failed=1
+            update_candidate=$(git -C "$update_repo" rev-parse --verify 'refs/team-skills/candidate^{commit}' 2>/dev/null) || update_failed=1
         fi
         if [ "$update_failed" -eq 0 ] && ! git -C "$update_repo" merge-base --is-ancestor "$update_previous" "$update_candidate" >/dev/null 2>&1; then
             printf '%s\n' "error: fetched catalog history is not a fast-forward; keeping the last known-good installation" >&2
@@ -891,10 +891,10 @@ else
             die "pinned catalog candidate is unavailable"
         [ "$CANDIDATE_REVISION" = "$CANDIDATE_ARGUMENT" ] || die "managed origin candidate changed during catalog update"
     else
-        if ! git -C "$MANAGED_REPO" fetch --quiet origin HEAD >"$WORK_ROOT/fetch.log" 2>&1; then
+        if ! git -C "$MANAGED_REPO" fetch --quiet origin '+HEAD:refs/team-skills/candidate' >"$WORK_ROOT/fetch.log" 2>&1; then
             die "unable to fetch the managed catalog origin"
         fi
-        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null) || \
+        CANDIDATE_REVISION=$(git -C "$MANAGED_REPO" rev-parse --verify 'refs/team-skills/candidate^{commit}' 2>/dev/null) || \
             die "managed origin HEAD has no commit"
     fi
     if ! git -C "$MANAGED_REPO" merge-base --is-ancestor "$PREVIOUS_REPO_HEAD" "$CANDIDATE_REVISION" >/dev/null 2>&1; then

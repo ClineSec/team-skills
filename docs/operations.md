@@ -161,8 +161,8 @@ follows that current remote `HEAD` without relying on stale local tracking metad
 
 Candidate validation requires regular, non-reparse lifecycle files for POSIX and Windows and a
 successful native parser check before managed-clone advancement. Therefore a missing, linked, or
-syntactically malformed self-update stays staged only in Git object storage and is never selected
-as the next session's managed runtime.
+syntactically malformed self-update stays isolated as candidate Git state and is never selected as
+the next session's managed runtime.
 
 ### A lock remains after interruption
 
