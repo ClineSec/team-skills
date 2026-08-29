@@ -25,6 +25,9 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.state = self.base / "state root"
         self.agents = self.home / ".agents" / "skills"
         self.claude = self.home / ".claude" / "skills"
+        self.claude_hooks = self.home / "config roots" / "claude" / "settings.json"
+        self.codex_hooks = self.home / "config roots" / "codex" / "hooks.json"
+        self.cursor_hooks = self.home / "config roots" / "cursor" / "hooks.json"
         self.home.mkdir()
         self.env = os.environ.copy()
         self.env.update(
@@ -34,6 +37,9 @@ class PowerShellInstallerTests(unittest.TestCase):
                 "TEAM_SKILLS_STATE_ROOT": str(self.state),
                 "TEAM_SKILLS_AGENTS_ROOT": str(self.agents),
                 "TEAM_SKILLS_CLAUDE_ROOT": str(self.claude),
+                "TEAM_SKILLS_CLAUDE_HOOKS_FILE": str(self.claude_hooks),
+                "TEAM_SKILLS_CODEX_HOOKS_FILE": str(self.codex_hooks),
+                "TEAM_SKILLS_CURSOR_HOOKS_FILE": str(self.cursor_hooks),
                 "GIT_CONFIG_NOSYSTEM": "1",
             }
         )
@@ -68,6 +74,9 @@ class PowerShellInstallerTests(unittest.TestCase):
             encoding="utf-8",
         )
         (skill / "references" / "fixture.txt").write_bytes(b"fixture bytes\r\n")
+        runtime = work / "scripts"
+        runtime.mkdir()
+        shutil.copy2(INSTALLER, runtime / "team-skills.ps1")
         self.git("init", "--initial-branch=main", str(work))
         self.git("config", "user.name", "Installer Test", cwd=work)
         self.git("config", "user.email", "installer@example.invalid", cwd=work)
@@ -128,6 +137,133 @@ class PowerShellInstallerTests(unittest.TestCase):
     def remove_junction(self, path: Path) -> None:
         # os.rmdir maps to RemoveDirectoryW and removes the junction, not its target.
         os.rmdir(path)
+
+    def read_hook_config(self, product: str) -> dict:
+        paths = {
+            "claude": self.claude_hooks,
+            "codex": self.codex_hooks,
+            "cursor": self.cursor_hooks,
+        }
+        return json.loads(paths[product].read_text(encoding="utf-8-sig"))
+
+    def owned_hook_commands(self, instance: Path | None = None) -> dict[str, str]:
+        if instance is None:
+            instance = next((self.state / "catalogs").iterdir())
+        return {
+            product: (instance / "hooks" / f"{product}.owner")
+            .read_text(encoding="utf-8-sig")
+            .splitlines()[1]
+            for product in ("claude", "codex", "cursor")
+        }
+
+    def test_hook_registration_preserves_foreign_config_and_is_idempotent(self) -> None:
+        _, origin = self.make_catalog("hooks", "# Hooks")
+        for path in (self.claude_hooks, self.codex_hooks, self.cursor_hooks):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        self.claude_hooks.write_text(
+            json.dumps(
+                {
+                    "foreign": {"preserve": True},
+                    "hooks": {"PreToolUse": [{"hooks": [{"command": "foreign-claude"}]}]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.codex_hooks.write_text(
+            json.dumps({"foreign": True, "hooks": {"Other": [{"command": "foreign-codex"}]}}),
+            encoding="utf-8",
+        )
+        self.cursor_hooks.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "foreign": [1, 2, 3],
+                    "hooks": {"workspaceOpen": [{"command": "keep-workspace"}]},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        commands = self.owned_hook_commands()
+        claude = self.read_hook_config("claude")
+        codex = self.read_hook_config("codex")
+        cursor = self.read_hook_config("cursor")
+        self.assertEqual(claude["foreign"], {"preserve": True})
+        self.assertEqual(claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "foreign-claude")
+        self.assertEqual(claude["hooks"]["SessionStart"][0]["matcher"], "startup|clear")
+        self.assertEqual(claude["hooks"]["SessionStart"][0]["hooks"][0]["command"], commands["claude"])
+        self.assertTrue(claude["hooks"]["SessionStart"][0]["hooks"][0]["async"])
+        self.assertEqual(codex["hooks"]["SessionStart"][0]["matcher"], "startup|clear")
+        self.assertEqual(codex["hooks"]["SessionStart"][0]["hooks"][0]["command"], commands["codex"])
+        self.assertEqual(cursor["hooks"]["workspaceOpen"], [{"command": "keep-workspace"}])
+        self.assertEqual(cursor["hooks"]["sessionStart"], [{"command": commands["cursor"]}])
+        before = {
+            product: json.dumps(self.read_hook_config(product), sort_keys=True)
+            for product in ("claude", "codex", "cursor")
+        }
+        repeated = self.run_installer("install", origin)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(
+            before,
+            {
+                product: json.dumps(self.read_hook_config(product), sort_keys=True)
+                for product in ("claude", "codex", "cursor")
+            },
+        )
+
+    def test_two_catalog_hooks_coexist_and_one_removal_is_exact(self) -> None:
+        _, first_origin = self.make_catalog("first-hooks", "# First hooks")
+        _, second_origin = self.make_catalog("second-hooks", "# Second hooks")
+        self.cursor_hooks.parent.mkdir(parents=True)
+        self.cursor_hooks.write_text(
+            json.dumps({"hooks": {"sessionStart": [{"command": "foreign"}]}}),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_installer("install", first_origin).returncode, 0)
+        self.assertEqual(
+            self.run_installer("install", second_origin, "-Prefix", "second").returncode, 0
+        )
+        instances = list((self.state / "catalogs").iterdir())
+        commands = {
+            instance.name: self.owned_hook_commands(instance)["cursor"] for instance in instances
+        }
+        before = [entry["command"] for entry in self.read_hook_config("cursor")["hooks"]["sessionStart"]]
+        self.assertEqual(set(before), {"foreign", *commands.values()})
+
+        removed = self.run_installer("remove", first_origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        after = [entry["command"] for entry in self.read_hook_config("cursor")["hooks"]["sessionStart"]]
+        self.assertIn("foreign", after)
+        self.assertEqual(len([command for command in commands.values() if command in after]), 1)
+        for product in ("claude", "codex", "cursor"):
+            serialized = json.dumps(self.read_hook_config(product))
+            self.assertNotIn(commands[next(key for key, value in commands.items() if value not in after)], serialized)
+
+    def test_malformed_hook_config_refuses_install_without_overwrite(self) -> None:
+        _, origin = self.make_catalog("malformed-hooks", "# Hooks")
+        self.claude_hooks.parent.mkdir(parents=True)
+        malformed = b'{"hooks":'
+        self.claude_hooks.write_bytes(malformed)
+        refused = self.run_installer("install", origin)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("malformed, unsupported", refused.stderr)
+        self.assertEqual(self.claude_hooks.read_bytes(), malformed)
+        self.assertFalse(self.codex_hooks.exists())
+        self.assertFalse(self.cursor_hooks.exists())
+
+    def test_hook_command_handles_unicode_spaces_and_shell_metacharacters(self) -> None:
+        self.state = self.base / "state root § & 'quoted'"
+        self.env["TEAM_SKILLS_STATE_ROOT"] = str(self.state)
+        _, origin = self.make_catalog("quoted-hooks", "# Hooks")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        command = self.owned_hook_commands()["claude"]
+        self.assertIn("-EncodedCommand", command)
+        self.assertNotIn(str(self.state), command)
+        for product in ("claude", "codex", "cursor"):
+            self.assertIn(command, json.dumps(self.read_hook_config(product)))
 
     def test_two_origins_collision_prefix_idempotence_and_safe_remove(self) -> None:
         _, first_origin = self.make_catalog("first", "# First catalog")

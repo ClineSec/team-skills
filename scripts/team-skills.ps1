@@ -32,6 +32,8 @@ $script:HadPreviousGeneration = $false
 $script:PreviousGenerationTarget = $null
 $script:PreviousRepoHead = $null
 $script:UpdateDiagnostics = [System.Collections.Generic.List[string]]::new()
+$script:HookStages = @()
+$script:HookChangesCommitted = $false
 
 function Fail([string]$Message) {
     throw [System.InvalidOperationException]::new($Message)
@@ -109,6 +111,341 @@ function Get-GitValue([string[]]$Arguments, [string]$FailureMessage) {
 function Read-Utf8Text([string]$Path) {
     $encoding = [System.Text.UTF8Encoding]::new($false, $true)
     return [System.IO.File]::ReadAllText($Path, $encoding)
+}
+
+function Get-ExactJsonProperty([object]$Object, [string]$Name) {
+    if ($Object -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    $matches = @($Object.PSObject.Properties | Where-Object { $_.Name -ceq $Name })
+    if ($matches.Count -eq 1) { return $matches[0] }
+    return $null
+}
+
+function Test-ExactJsonShape([object]$Object, [string[]]$Names) {
+    if ($Object -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    $actual = @($Object.PSObject.Properties.Name | Sort-Object)
+    $expected = @($Names | Sort-Object)
+    return ($actual -join "`n") -ceq ($expected -join "`n")
+}
+
+function Get-JsonArray([object]$Value) {
+    if ($Value -is [System.Array]) { return ,([object[]]$Value) }
+    return $null
+}
+
+function Test-OwnedLifecycleGroup([object]$Value, [string]$Command) {
+    if (-not (Test-ExactJsonShape $Value @('matcher', 'hooks'))) { return $false }
+    $matcher = Get-ExactJsonProperty $Value 'matcher'
+    $handlers = Get-ExactJsonProperty $Value 'hooks'
+    if ($matcher.Value -isnot [string] -or $matcher.Value -cne 'startup|clear') { return $false }
+    $handlerArray = Get-JsonArray $handlers.Value
+    if ($null -eq $handlerArray -or $handlerArray.Count -ne 1) { return $false }
+    $handler = $handlerArray[0]
+    if (-not (Test-ExactJsonShape $handler @('type', 'command', 'async'))) { return $false }
+    $type = Get-ExactJsonProperty $handler 'type'
+    $commandProperty = Get-ExactJsonProperty $handler 'command'
+    $async = Get-ExactJsonProperty $handler 'async'
+    return $type.Value -is [string] -and $type.Value -ceq 'command' -and
+        $commandProperty.Value -is [string] -and $commandProperty.Value -ceq $Command -and
+        $async.Value -is [bool] -and $async.Value
+}
+
+function Test-OwnedCursorHook([object]$Value, [string]$Command) {
+    if (-not (Test-ExactJsonShape $Value @('command'))) { return $false }
+    $commandProperty = Get-ExactJsonProperty $Value 'command'
+    return $commandProperty.Value -is [string] -and $commandProperty.Value -ceq $Command
+}
+
+function Edit-HookJson([string]$Text, [string]$Operation, [string]$Product, [string]$Command) {
+    try {
+        $root = $Text | ConvertFrom-Json
+    }
+    catch {
+        Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+    }
+    if ($root -isnot [System.Management.Automation.PSCustomObject]) {
+        Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+    }
+
+    $hooksProperty = Get-ExactJsonProperty $root 'hooks'
+    if ($null -eq $hooksProperty) {
+        if ($Operation -ceq 'remove') {
+            Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+        }
+        $hooksValue = [PSCustomObject][ordered]@{}
+        Add-Member -InputObject $root -MemberType NoteProperty -Name 'hooks' -Value $hooksValue
+    }
+    else {
+        $hooksValue = $hooksProperty.Value
+        if ($hooksValue -isnot [System.Management.Automation.PSCustomObject]) {
+            Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+        }
+    }
+
+    if ($Product -ceq 'cursor') {
+        $versionProperty = Get-ExactJsonProperty $root 'version'
+        if ($null -eq $versionProperty) {
+            if ($Operation -ceq 'add') {
+                Add-Member -InputObject $root -MemberType NoteProperty -Name 'version' -Value 1
+            }
+        }
+        elseif (($versionProperty.Value -isnot [int] -and $versionProperty.Value -isnot [long]) -or
+                $versionProperty.Value -ne 1) {
+            Fail "cursor hook configuration is malformed, unsupported, or no longer owned"
+        }
+        $eventName = 'sessionStart'
+    }
+    else {
+        $eventName = 'SessionStart'
+    }
+
+    $eventProperty = Get-ExactJsonProperty $hooksValue $eventName
+    if ($null -eq $eventProperty) {
+        if ($Operation -ceq 'remove') {
+            Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+        }
+        Add-Member -InputObject $hooksValue -MemberType NoteProperty -Name $eventName -Value @()
+        $eventProperty = Get-ExactJsonProperty $hooksValue $eventName
+    }
+    $event = Get-JsonArray $eventProperty.Value
+    if ($null -eq $event) {
+        Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+    }
+
+    $matches = @()
+    for ($index = 0; $index -lt $event.Count; $index++) {
+        $owned = if ($Product -ceq 'cursor') {
+            Test-OwnedCursorHook $event[$index] $Command
+        } else {
+            Test-OwnedLifecycleGroup $event[$index] $Command
+        }
+        if ($owned) { $matches += $index }
+    }
+
+    if ($Operation -ceq 'add') {
+        if ($matches.Count -eq 0) {
+            $entry = if ($Product -ceq 'cursor') {
+                [PSCustomObject][ordered]@{ command = $Command }
+            } else {
+                [PSCustomObject][ordered]@{
+                    matcher = 'startup|clear'
+                    hooks = @([PSCustomObject][ordered]@{
+                        type = 'command'
+                        command = $Command
+                        async = $true
+                    })
+                }
+            }
+            $eventProperty.Value = @($event) + @($entry)
+        }
+    }
+    elseif ($Operation -ceq 'remove') {
+        if ($matches.Count -ne 1) {
+            Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+        }
+        $remaining = @()
+        for ($index = 0; $index -lt $event.Count; $index++) {
+            if ($index -ne $matches[0]) { $remaining += $event[$index] }
+        }
+        $eventProperty.Value = $remaining
+    }
+    else {
+        Fail "unsupported hook edit operation"
+    }
+    return ($root | ConvertTo-Json -Depth 100) + [Environment]::NewLine
+}
+
+function Get-HookConfigPath([string]$Product) {
+    switch ($Product) {
+        'claude' { return $ClaudeHooksFile }
+        'codex' { return $CodexHooksFile }
+        'cursor' { return $CursorHooksFile }
+        default { Fail "unsupported hook product" }
+    }
+}
+
+function Get-HookCommand([string]$RuntimePath, [string]$InstanceKey) {
+    $escapedRuntime = $RuntimePath.Replace("'", "''")
+    $escapedKey = $InstanceKey.Replace("'", "''")
+    $payload = "& '$escapedRuntime' hook '$escapedKey'"
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($payload))
+    return 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + $encoded
+}
+
+function Test-FileBytesEqual([string]$First, [string]$Second) {
+    try {
+        $left = [System.IO.File]::ReadAllBytes($First)
+        $right = [System.IO.File]::ReadAllBytes($Second)
+    }
+    catch { return $false }
+    if ($left.Length -ne $right.Length) { return $false }
+    for ($index = 0; $index -lt $left.Length; $index++) {
+        if ($left[$index] -ne $right[$index]) { return $false }
+    }
+    return $true
+}
+
+function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigPath, [string]$Command) {
+    $stageRoot = Join-Path (Join-Path $WorkRoot 'hooks') $Product
+    $null = New-Item -ItemType Directory -Force -Path $stageRoot
+    $beforePath = Join-Path $stageRoot 'before.json'
+    $afterPath = Join-Path $stageRoot 'after.json'
+    $existed = Test-PathEntry $ConfigPath
+    if ($existed) {
+        $item = Get-Item -Force -LiteralPath $ConfigPath
+        if (-not ($item -is [System.IO.FileInfo]) -or (Test-ReparsePoint $item)) {
+            Fail "$Product hook configuration is not a regular file"
+        }
+        [System.IO.File]::WriteAllBytes($beforePath, [System.IO.File]::ReadAllBytes($ConfigPath))
+        $beforeText = Read-Utf8Text $beforePath
+    }
+    else {
+        $beforeText = '{}' + [Environment]::NewLine
+        [System.IO.File]::WriteAllText($beforePath, $beforeText, [System.Text.UTF8Encoding]::new($false))
+    }
+    $afterText = Edit-HookJson $beforeText $Operation $Product $Command
+    [System.IO.File]::WriteAllText($afterPath, $afterText, [System.Text.UTF8Encoding]::new($false))
+    $script:HookStages += [PSCustomObject]@{
+        Product = $Product
+        ConfigPath = $ConfigPath
+        BeforePath = $beforePath
+        AfterPath = $afterPath
+        Existed = $existed
+        Committed = $false
+    }
+}
+
+function Prepare-HookRegistration([string]$SourceRoot, [string]$InstanceRoot, [string]$InstanceKey) {
+    $sourceRuntime = Join-Path (Join-Path $SourceRoot 'scripts') 'team-skills.ps1'
+    $managedRuntime = Join-Path (Join-Path (Join-Path $InstanceRoot 'repo') 'scripts') 'team-skills.ps1'
+    if (-not (Test-PathEntry $sourceRuntime)) { Fail "catalog is missing its PowerShell lifecycle utility" }
+    $script:HookCommand = Get-HookCommand $managedRuntime $InstanceKey
+    $script:HookOwnershipRoot = Join-Path $InstanceRoot 'hooks'
+    foreach ($product in @('claude', 'codex', 'cursor')) {
+        $configPath = Get-HookConfigPath $product
+        $ownerPath = Join-Path $script:HookOwnershipRoot ($product + '.owner')
+        if (Test-PathEntry $ownerPath) {
+            $ownerItem = Get-Item -Force -LiteralPath $ownerPath
+            if (-not ($ownerItem -is [System.IO.FileInfo]) -or (Test-ReparsePoint $ownerItem)) {
+                Fail "$product hook ownership state is invalid"
+            }
+            $ownerLines = [System.IO.File]::ReadAllLines($ownerPath)
+            if ($ownerLines.Count -ne 2 -or $ownerLines[0] -cne $configPath -or
+                    $ownerLines[1] -cne $script:HookCommand) {
+                Fail "$product hook ownership path or command changed"
+            }
+        }
+        Prepare-HookEdit 'add' $product $configPath $script:HookCommand
+    }
+}
+
+function Prepare-HookRemoval([string]$InstanceRoot, [string]$InstanceKey) {
+    $script:HookOwnershipRoot = Join-Path $InstanceRoot 'hooks'
+    if (-not (Test-PathEntry $script:HookOwnershipRoot)) { return }
+    $ownershipItem = Get-Item -Force -LiteralPath $script:HookOwnershipRoot
+    if (-not ($ownershipItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $ownershipItem)) {
+        Fail "catalog hook ownership root is invalid"
+    }
+    $expectedCommand = Get-HookCommand (Join-Path (Join-Path (Join-Path $InstanceRoot 'repo') 'scripts') 'team-skills.ps1') $InstanceKey
+    foreach ($product in @('claude', 'codex', 'cursor')) {
+        $ownerPath = Join-Path $script:HookOwnershipRoot ($product + '.owner')
+        if (-not (Test-PathEntry $ownerPath)) { continue }
+        $ownerItem = Get-Item -Force -LiteralPath $ownerPath
+        if (-not ($ownerItem -is [System.IO.FileInfo]) -or (Test-ReparsePoint $ownerItem)) {
+            Fail "$product hook ownership state is invalid"
+        }
+        $ownerLines = [System.IO.File]::ReadAllLines($ownerPath)
+        if ($ownerLines.Count -ne 2 -or $ownerLines[1] -cne $expectedCommand) {
+            Fail "$product hook ownership command no longer matches its target"
+        }
+        $configPath = Get-FullSafeRoot $ownerLines[0] "$product owned hook configuration path"
+        Prepare-HookEdit 'remove' $product $configPath $ownerLines[1]
+    }
+}
+
+function Rollback-HookChanges {
+    if (-not $script:HookChangesCommitted) { return $true }
+    $rollbackSucceeded = $true
+    foreach ($stage in $script:HookStages) {
+        if (-not $stage.Committed) { continue }
+        if ((Test-PathEntry $stage.ConfigPath) -and
+                (Test-FileBytesEqual $stage.ConfigPath $stage.AfterPath)) {
+            try {
+                if ($stage.Existed) {
+                    $parent = [System.IO.Path]::GetDirectoryName($stage.ConfigPath)
+                    $temporary = Join-Path $parent ('.team-skills-rollback.' + [guid]::NewGuid().ToString('N'))
+                    [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.BeforePath))
+                    Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
+                }
+                else {
+                    Remove-Item -Force -LiteralPath $stage.ConfigPath
+                }
+            }
+            catch { $rollbackSucceeded = $false }
+        }
+        else {
+            $rollbackSucceeded = $false
+        }
+    }
+    $script:HookChangesCommitted = $false
+    return $rollbackSucceeded
+}
+
+function Commit-HookChanges {
+    if ($script:HookStages.Count -eq 0) { return }
+    $script:HookChangesCommitted = $true
+    foreach ($stage in $script:HookStages) {
+        if ($stage.Existed) {
+            if (-not (Test-PathEntry $stage.ConfigPath) -or
+                    -not (Test-FileBytesEqual $stage.ConfigPath $stage.BeforePath)) {
+                $null = Rollback-HookChanges
+                Fail "$($stage.Product) hook configuration changed during installation"
+            }
+        }
+        elseif (Test-PathEntry $stage.ConfigPath) {
+            $null = Rollback-HookChanges
+            Fail "$($stage.Product) hook configuration appeared during installation"
+        }
+        $parent = [System.IO.Path]::GetDirectoryName($stage.ConfigPath)
+        $null = New-Item -ItemType Directory -Force -Path $parent
+        $temporary = Join-Path $parent ('.team-skills-hooks.' + [guid]::NewGuid().ToString('N'))
+        try {
+            [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.AfterPath))
+            Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
+            $stage.Committed = $true
+        }
+        catch {
+            if (Test-PathEntry $temporary) { Remove-Item -Force -LiteralPath $temporary -ErrorAction SilentlyContinue }
+            $null = Rollback-HookChanges
+            Fail "cannot atomically update $($stage.Product) hook configuration"
+        }
+    }
+}
+
+function Finalize-HookOwnership([bool]$Removing) {
+    if ($script:HookStages.Count -eq 0) { return }
+    if ($Removing) {
+        Remove-Item -Recurse -Force -LiteralPath $script:HookOwnershipRoot
+        $script:HookChangesCommitted = $false
+        return
+    }
+    if (Test-PathEntry $script:HookOwnershipRoot) {
+        $item = Get-Item -Force -LiteralPath $script:HookOwnershipRoot
+        if (-not ($item -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $item)) {
+            Fail "catalog hook ownership root is invalid"
+        }
+    }
+    else {
+        $null = New-Item -ItemType Directory -Path $script:HookOwnershipRoot
+    }
+    foreach ($product in @('claude', 'codex', 'cursor')) {
+        $ownerPath = Join-Path $script:HookOwnershipRoot ($product + '.owner')
+        $temporary = Join-Path $script:HookOwnershipRoot ('.' + $product + '.owner.' + [guid]::NewGuid().ToString('N'))
+        $text = (Get-HookConfigPath $product) + [Environment]::NewLine +
+            $script:HookCommand + [Environment]::NewLine
+        [System.IO.File]::WriteAllText($temporary, $text, [System.Text.UTF8Encoding]::new($false))
+        Move-Item -Force -LiteralPath $temporary -Destination $ownerPath
+    }
+    $script:HookChangesCommitted = $false
 }
 
 function Test-Skill([string]$SkillDirectory, [string]$ExpectedName) {
@@ -531,9 +868,15 @@ function Invoke-HookLaunch([string]$InstanceKey) {
 }
 
 function Invoke-TransactionRollback {
-    if (-not $script:TransactionActive) { return }
+    $hookRollbackFailed = -not (Rollback-HookChanges)
+    if (-not $script:TransactionActive) {
+        if ($hookRollbackFailed) {
+            [Console]::Error.WriteLine("warning: installation rollback could not fully restore catalog-owned hook configuration")
+        }
+        return
+    }
     $script:TransactionActive = $false
-    $rollbackFailed = $false
+    $rollbackFailed = $hookRollbackFailed
 
     # Remove newly created links while their candidate targets still exist, so junction
     # ownership remains inspectable before the current generation is restored.
@@ -619,9 +962,16 @@ try {
     $stateValue = if ($env:TEAM_SKILLS_STATE_ROOT) { $env:TEAM_SKILLS_STATE_ROOT } else { $defaultState }
     $agentsValue = if ($env:TEAM_SKILLS_AGENTS_ROOT) { $env:TEAM_SKILLS_AGENTS_ROOT } else { Join-Path $env:USERPROFILE ".agents\skills" }
     $claudeValue = if ($env:TEAM_SKILLS_CLAUDE_ROOT) { $env:TEAM_SKILLS_CLAUDE_ROOT } else { Join-Path $env:USERPROFILE ".claude\skills" }
+    $claudeHooksValue = if ($env:TEAM_SKILLS_CLAUDE_HOOKS_FILE) { $env:TEAM_SKILLS_CLAUDE_HOOKS_FILE } else { Join-Path $env:USERPROFILE ".claude\settings.json" }
+    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
+    $codexHooksValue = if ($env:TEAM_SKILLS_CODEX_HOOKS_FILE) { $env:TEAM_SKILLS_CODEX_HOOKS_FILE } else { Join-Path $codexHome "hooks.json" }
+    $cursorHooksValue = if ($env:TEAM_SKILLS_CURSOR_HOOKS_FILE) { $env:TEAM_SKILLS_CURSOR_HOOKS_FILE } else { Join-Path $env:USERPROFILE ".cursor\hooks.json" }
     $StateRoot = Get-FullSafeRoot $stateValue "TEAM_SKILLS_STATE_ROOT"
     $AgentsRoot = Get-FullSafeRoot $agentsValue "TEAM_SKILLS_AGENTS_ROOT"
     $ClaudeRoot = Get-FullSafeRoot $claudeValue "TEAM_SKILLS_CLAUDE_ROOT"
+    $ClaudeHooksFile = Get-FullSafeRoot $claudeHooksValue "TEAM_SKILLS_CLAUDE_HOOKS_FILE"
+    $CodexHooksFile = Get-FullSafeRoot $codexHooksValue "TEAM_SKILLS_CODEX_HOOKS_FILE"
+    $CursorHooksFile = Get-FullSafeRoot $cursorHooksValue "TEAM_SKILLS_CURSOR_HOOKS_FILE"
 
     if ($Action -ceq "hook") {
         Invoke-HookLaunch $RepositoryUrl
@@ -770,6 +1120,16 @@ try {
             Write-Output "Catalog $($manifest.catalog_id) prefix '$Prefix' is already absent."
             exit 0
         }
+        $remainingInstall = @(
+            Get-ChildItem -Force -LiteralPath (Join-Path $instanceRoot 'installs') | Where-Object {
+                $_ -is [System.IO.DirectoryInfo] -and -not (Test-ReparsePoint $_) -and
+                    $_.FullName -cne $installRoot
+            }
+        ).Count -gt 0
+        if (-not $remainingInstall) {
+            Prepare-HookRemoval $instanceRoot $instanceKey
+            Commit-HookChanges
+        }
         foreach ($product in @('agents', 'claude')) {
             $productRoot = if ($product -ceq 'agents') { $AgentsRoot } else { $ClaudeRoot }
             $owners = Join-Path (Join-Path $installRoot "ownership") $product
@@ -789,6 +1149,7 @@ try {
         Remove-Item -Recurse -Force -LiteralPath $installRoot
         $installsRoot = Join-Path $instanceRoot "installs"
         if ((Test-PathEntry $installsRoot) -and @(Get-ChildItem -Force -LiteralPath $installsRoot).Count -eq 0) {
+            if (-not $remainingInstall) { Finalize-HookOwnership $true }
             Remove-Item -Recurse -Force -LiteralPath $instanceRoot
             if ((Test-PathEntry $originIndex) -and ([System.IO.File]::ReadAllText($originIndex)).Trim() -ceq $instanceKey) {
                 Remove-Item -Force -LiteralPath $originIndex
@@ -828,6 +1189,9 @@ try {
     if ($null -eq $manifest) { Fail "catalog is invalid; keeping the last known-good installation" }
     if ($manifest.catalog_id -cne $instanceCatalogId) {
         Fail "fetched catalog identity changed; keeping the last known-good installation"
+    }
+    if ($Action -ceq 'install') {
+        Prepare-HookRegistration $sourceRoot $instanceRoot $instanceKey
     }
     if (-not $PrefixWasSupplied) { $Prefix = $manifest.default_prefix }
     $installKey = if ($Prefix.Length -gt 0) { $Prefix } else { "_default" }
@@ -949,6 +1313,8 @@ try {
             Fail "installed view is valid but managed clone could not advance"
         }
     }
+    Commit-HookChanges
+    Finalize-HookOwnership $false
     $script:TransactionActive = $false
     Write-Output "Installed catalog $($manifest.catalog_id) as instance $instanceKey with prefix '$Prefix'."
 }
