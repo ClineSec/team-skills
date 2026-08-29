@@ -589,7 +589,9 @@ function Write-UpdateDiagnostic([string]$Message) {
     if ($script:UpdateDiagnostics.Count -lt 256) {
         $script:UpdateDiagnostics.Add($Message)
     }
-    [Console]::Error.WriteLine($Message)
+    if ($env:TEAM_SKILLS_INTERNAL_HOOK_LOG -cne "1") {
+        [Console]::Error.WriteLine($Message)
+    }
 }
 
 function Get-UpdateTimingValue([string]$Name, [long]$DefaultValue) {
@@ -819,11 +821,21 @@ function Invoke-CatalogUpdate([string]$InstanceKey) {
 }
 
 function Write-AtomicBoundedLog([string]$Path, [string]$Text) {
-    if ($Text.Length -gt 65536) { $Text = $Text.Substring($Text.Length - 65536) }
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    $bytes = $encoding.GetBytes($Text)
+    if ($bytes.Length -gt 65536) {
+        $offset = $bytes.Length - 65536
+        while ($offset -lt $bytes.Length -and ($bytes[$offset] -band 0xC0) -eq 0x80) {
+            $offset++
+        }
+        $bounded = [byte[]]::new($bytes.Length - $offset)
+        [System.Array]::Copy($bytes, $offset, $bounded, 0, $bounded.Length)
+        $bytes = $bounded
+    }
     $parent = [System.IO.Path]::GetDirectoryName($Path)
     $null = New-Item -ItemType Directory -Force -Path $parent
     $temporary = Join-Path $parent (".last-update." + [guid]::NewGuid().ToString("N"))
-    [System.IO.File]::WriteAllText($temporary, $Text, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllBytes($temporary, $bytes)
     Move-Item -Force -LiteralPath $temporary -Destination $Path
 }
 
@@ -854,7 +866,7 @@ function Invoke-HookLaunch([string]$InstanceKey) {
         $escapedKey = $InstanceKey.Replace("'", "''")
         $command = @"
 `$env:TEAM_SKILLS_INTERNAL_HOOK_LOG = '1'
-& '$escapedScript' update-instance '$escapedKey'
+& '$escapedScript' update-instance '$escapedKey' *> `$null
 "@
         $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
         $start = [System.Diagnostics.ProcessStartInfo]::new()
@@ -862,7 +874,12 @@ function Invoke-HookLaunch([string]$InstanceKey) {
         $start.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + $encoded
         $start.UseShellExecute = $false
         $start.CreateNoWindow = $true
-        $null = [System.Diagnostics.Process]::Start($start)
+        $start.RedirectStandardInput = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $process = [System.Diagnostics.Process]::Start($start)
+        $process.StandardInput.Close()
+        $process.Dispose()
     }
     catch { }
 }

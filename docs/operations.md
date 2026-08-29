@@ -138,11 +138,12 @@ rolled back. Correct or restore the file, preserve its unrelated fields, and rer
 
 ### Fetch or candidate validation fails
 
-The current generation and exposures remain active. Hook logs use fixed diagnostics and suppress
-Git fetch output so credential-bearing origins are not exposed. Correct authentication, network
-access, the clone's configured origin, or the remote catalog, then wait for the next eligible
-session or run `update-all`. An origin may be deliberately changed with `git remote set-url origin`
-inside the managed clone; later updates follow that value without changing instance ownership.
+The current generation and exposures remain active. Hook logs use fixed diagnostics, suppress Git
+fetch output so credential-bearing origins are not exposed, and atomically retain at most the final
+64 KiB from the latest attempt. Correct authentication, network access, the clone's configured
+origin, or the remote catalog, then wait for the next eligible session or run `update-all`. An
+origin may be deliberately changed with `git remote set-url origin` inside the managed clone; later
+updates follow that value without changing instance ownership.
 
 ### A lock remains after interruption
 

@@ -6,6 +6,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -656,6 +657,168 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertFalse(lock.exists())
         self.assertEqual((instance / "last-success").read_text().strip(), "10000")
+
+    def test_unexpected_stale_lock_contents_are_not_removed(self) -> None:
+        _, origin = self.make_catalog("unsafe-stale", "# Initial")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = self.instance_root()
+        lock = instance / "update.lock"
+        lock.mkdir()
+        (lock / "owner").write_text("99999999\n100\n", encoding="utf-8")
+        marker = lock / "unexpected"
+        marker.write_text("preserve\n", encoding="utf-8")
+        self.env.update(
+            {
+                "TEAM_SKILLS_NOW": "10000",
+                "TEAM_SKILLS_STALE_LOCK_SECONDS": "1000",
+                "TEAM_SKILLS_THROTTLE_SECONDS": "0",
+            }
+        )
+
+        skipped = self.run_updater()
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "preserve\n")
+        self.assertFalse((instance / "last-success").exists())
+
+    def test_concurrent_updates_fetch_once(self) -> None:
+        _, origin = self.make_catalog("concurrent", "# Initial")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = self.instance_root()
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        command_bin = self.base / "concurrency command bin"
+        command_bin.mkdir()
+        git_wrapper = command_bin / "git"
+        git_wrapper.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = -C ] && [ \"$3\" = fetch ]; then\n"
+            "  printf '%s\\n' fetch >>\"$TEAM_SKILLS_TEST_FETCH_LOG\"\n"
+            "  sleep 2\n"
+            "fi\n"
+            "exec \"$TEAM_SKILLS_TEST_REAL_GIT\" \"$@\"\n",
+            encoding="utf-8",
+        )
+        git_wrapper.chmod(0o755)
+        fetch_log = self.base / "fetch calls.log"
+        self.env.update(
+            {
+                "PATH": str(command_bin) + os.pathsep + self.env["PATH"],
+                "TEAM_SKILLS_TEST_REAL_GIT": real_git or "",
+                "TEAM_SKILLS_TEST_FETCH_LOG": str(fetch_log),
+                "TEAM_SKILLS_NOW": "2000000000",
+                "TEAM_SKILLS_THROTTLE_SECONDS": "0",
+            }
+        )
+
+        first = subprocess.Popen(
+            ["sh", str(INSTALLER), "update-instance", instance.name],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env,
+        )
+        deadline = time.monotonic() + 10
+        while not fetch_log.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(fetch_log.exists(), "first updater did not reach fetch")
+        second = self.run_updater("update-instance", instance.name)
+        first_stdout, first_stderr = first.communicate(timeout=20)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
+        self.assertEqual(fetch_log.read_text(encoding="utf-8").splitlines(), ["fetch"])
+
+    def test_detached_hook_returns_promptly_and_bounds_log(self) -> None:
+        _, origin = self.make_catalog("detached", "# Initial")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = self.instance_root()
+        runtime = instance / "repo" / "scripts" / "team-skills.sh"
+        source = runtime.read_text(encoding="utf-8")
+        needle = 'if [ "$ACTION" = update-instance ]; then\n    run_catalog_update'
+        replacement = (
+            'if [ "$ACTION" = update-instance ]; then\n'
+            "    sleep 3\n"
+            "    printf 'detached-marker:' >&2\n"
+            "    head -c 70000 /dev/zero | tr '\\000' x >&2\n"
+            "    printf '\\n' >&2\n"
+            "    run_catalog_update"
+        )
+        self.assertIn(needle, source)
+        runtime.write_text(source.replace(needle, replacement, 1), encoding="utf-8")
+        self.env.update(
+            {
+                "TEAM_SKILLS_NOW": "2000000000",
+                "TEAM_SKILLS_THROTTLE_SECONDS": "0",
+            }
+        )
+
+        started = time.monotonic()
+        launched = subprocess.run(
+            ["sh", str(runtime), "hook", instance.name],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=self.env,
+            timeout=2,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        self.assertLess(elapsed, 1.5)
+
+        log = instance / "last-update.log"
+        deadline = time.monotonic() + 15
+        while (not log.exists() or log.stat().st_size == 0) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(log.exists(), "detached updater did not produce a log")
+        self.assertLessEqual(log.stat().st_size, 65536)
+        self.assertNotIn("detached-marker", log.read_text(encoding="utf-8"))
+
+    def test_update_all_isolates_failure_and_clean_retry_succeeds(self) -> None:
+        first_work, first_origin = self.make_catalog("failure-first", "# First initial")
+        second_work, second_origin = self.make_catalog("failure-second", "# Second initial")
+        self.assertEqual(self.run_installer("install", first_origin).returncode, 0)
+        self.assertEqual(
+            self.run_installer("install", second_origin, "--prefix", "second").returncode, 0
+        )
+        instances = list((self.state / "catalogs").iterdir())
+        instance_by_origin = {
+            self.git("remote", "get-url", "origin", cwd=instance / "repo").stdout.strip(): instance
+            for instance in instances
+        }
+        first_instance = instance_by_origin[str(first_origin)]
+        self.git(
+            "remote", "set-url", "origin", str(self.base / "missing origin"),
+            cwd=first_instance / "repo",
+        )
+        second_skill = second_work / "skills" / "common-skill" / "SKILL.md"
+        second_skill.write_text(
+            second_skill.read_text(encoding="utf-8").replace("# Second initial", "# Second updated"),
+            encoding="utf-8",
+        )
+        self.git("add", ".", cwd=second_work)
+        self.git("commit", "-m", "update second catalog", cwd=second_work)
+        self.git("push", cwd=second_work)
+        self.env.update({"TEAM_SKILLS_NOW": "2000000000", "TEAM_SKILLS_THROTTLE_SECONDS": "0"})
+
+        isolated = self.run_updater()
+        self.assertNotEqual(isolated.returncode, 0)
+        self.assertIn("unable to fetch the managed catalog origin", isolated.stderr)
+        self.assertIn(
+            "# Second updated", (self.claude / "second-common-skill" / "SKILL.md").read_text()
+        )
+
+        self.git("remote", "set-url", "origin", str(first_origin), cwd=first_instance / "repo")
+        first_skill = first_work / "skills" / "common-skill" / "SKILL.md"
+        first_skill.write_text(
+            first_skill.read_text(encoding="utf-8").replace("# First initial", "# First recovered"),
+            encoding="utf-8",
+        )
+        self.git("add", ".", cwd=first_work)
+        self.git("commit", "-m", "recover first catalog", cwd=first_work)
+        self.git("push", cwd=first_work)
+        self.env["TEAM_SKILLS_NOW"] = "2000000001"
+        retried = self.run_updater()
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIn("# First recovered", (self.agents / "common-skill" / "SKILL.md").read_text())
 
     def test_hook_masks_failure_and_credential_safe_log_retains_known_good(self) -> None:
         _, origin = self.make_catalog("hook-failure", "# Known good")

@@ -48,7 +48,7 @@ case $ACTION in
         [ "$#" -eq 1 ] || usage
         shift
         ;;
-    hook|update-instance)
+    hook|hook-worker|update-instance)
         [ "$#" -eq 2 ] || usage
         INSTANCE_ARGUMENT=$2
         shift 2
@@ -300,6 +300,15 @@ run_catalog_update() {
             printf '%s\n' "warning: unsafe update lock path; skipping catalog" >&2
             return 0
         }
+        lock_entry_count=0
+        for lock_entry in "$lock_root"/* "$lock_root"/.[!.]* "$lock_root"/..?*; do
+            [ -e "$lock_entry" ] || [ -L "$lock_entry" ] || continue
+            lock_entry_count=$((lock_entry_count + 1))
+            [ "$lock_entry" = "$lock_root/owner" ] || return 0
+        done
+        [ "$lock_entry_count" -eq 1 ] && [ -f "$lock_root/owner" ] && \
+            [ ! -L "$lock_root/owner" ] || return 0
+        [ "$(wc -l <"$lock_root/owner" 2>/dev/null || :)" -eq 2 ] 2>/dev/null || return 0
         lock_pid=$(sed -n '1p' "$lock_root/owner" 2>/dev/null || :)
         lock_time=$(sed -n '2p' "$lock_root/owner" 2>/dev/null || :)
         case $lock_pid:$lock_time in
@@ -381,17 +390,44 @@ case $0 in
     *) SCRIPT_PATH=$(pwd)/$0 ;;
 esac
 
+if [ "$ACTION" = hook-worker ]; then
+    valid_instance_key "$INSTANCE_ARGUMENT" || exit 0
+    hook_root=$STATE_ROOT/catalogs/$INSTANCE_ARGUMENT
+    [ -d "$hook_root" ] && [ ! -L "$hook_root" ] || exit 0
+    hook_log=$hook_root/last-update.log
+    hook_temp=$(mktemp "$hook_root/.last-update.XXXXXXXX") || exit 0
+    hook_bounded=
+    cleanup_hook_worker() {
+        rm -f "$hook_temp"
+        [ -z "$hook_bounded" ] || rm -f "$hook_bounded"
+    }
+    trap cleanup_hook_worker EXIT HUP INT TERM
+    hook_result=0
+    "$SCRIPT_PATH" update-instance "$INSTANCE_ARGUMENT" >"$hook_temp" 2>&1 || hook_result=$?
+    hook_bytes=$(wc -c <"$hook_temp" 2>/dev/null | tr -d '[:space:]' || printf '%s' 0)
+    case $hook_bytes in *[!0-9]*|'') hook_bytes=0 ;; esac
+    if [ "$hook_bytes" -gt 65536 ]; then
+        hook_bounded=$(mktemp "$hook_root/.last-update-bounded.XXXXXXXX") || exit "$hook_result"
+        tail -c 65536 "$hook_temp" >"$hook_bounded" || exit "$hook_result"
+        mv "$hook_bounded" "$hook_log" || exit "$hook_result"
+        hook_bounded=
+    else
+        mv "$hook_temp" "$hook_log" || exit "$hook_result"
+        hook_temp=
+    fi
+    trap - EXIT HUP INT TERM
+    exit "$hook_result"
+fi
+
 if [ "$ACTION" = hook ]; then
     valid_instance_key "$INSTANCE_ARGUMENT" || exit 0
     hook_root=$STATE_ROOT/catalogs/$INSTANCE_ARGUMENT
     [ -d "$hook_root" ] && [ ! -L "$hook_root" ] || exit 0
     hook_log=$hook_root/last-update.log
     if [ "${TEAM_SKILLS_TEST_FOREGROUND:-0}" = 1 ]; then
-        sh -c '"$1" update-instance "$2" >"$3.tmp.$$" 2>&1; result=$?; mv "$3.tmp.$$" "$3"; exit $result' \
-            team-skills-hook "$SCRIPT_PATH" "$INSTANCE_ARGUMENT" "$hook_log" || :
+        "$SCRIPT_PATH" hook-worker "$INSTANCE_ARGUMENT" || :
     else
-        nohup sh -c '"$1" update-instance "$2" >"$3.tmp.$$" 2>&1; result=$?; mv "$3.tmp.$$" "$3"; exit $result' \
-            team-skills-hook "$SCRIPT_PATH" "$INSTANCE_ARGUMENT" "$hook_log" </dev/null >/dev/null 2>&1 &
+        nohup "$SCRIPT_PATH" hook-worker "$INSTANCE_ARGUMENT" </dev/null >/dev/null 2>&1 &
     fi
     exit 0
 fi
