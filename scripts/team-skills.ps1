@@ -290,11 +290,19 @@ function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigP
     $beforePath = Join-Path $stageRoot 'before.json'
     $afterPath = Join-Path $stageRoot 'after.json'
     $existed = Test-PathEntry $ConfigPath
+    $accessControl = $null
     if ($existed) {
         $item = Get-Item -Force -LiteralPath $ConfigPath
         if (-not ($item -is [System.IO.FileInfo]) -or (Test-ReparsePoint $item)) {
             Fail "$Product hook configuration is not a regular file"
         }
+        try {
+            $accessControl = [System.IO.File]::GetAccessControl(
+                $ConfigPath,
+                [System.Security.AccessControl.AccessControlSections]::Access
+            )
+        }
+        catch { Fail "cannot preserve $Product hook configuration access protection" }
         [System.IO.File]::WriteAllBytes($beforePath, [System.IO.File]::ReadAllBytes($ConfigPath))
         $beforeText = Read-Utf8Text $beforePath
     }
@@ -310,6 +318,7 @@ function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigP
         BeforePath = $beforePath
         AfterPath = $afterPath
         Existed = $existed
+        AccessControl = $accessControl
         Committed = $false
     }
 }
@@ -374,9 +383,9 @@ function Rollback-HookChanges {
                     $parent = [System.IO.Path]::GetDirectoryName($stage.ConfigPath)
                     $temporary = Join-Path $parent ('.team-skills-rollback.' + [guid]::NewGuid().ToString('N'))
                     [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.BeforePath))
-                    # File.Replace uses ReplaceFileW on native Windows, retaining the
-                    # destination's access protection while replacing bytes atomically.
-                    [System.IO.File]::Replace($temporary, $stage.ConfigPath, $null)
+                    [System.IO.File]::SetAccessControl($temporary, $stage.AccessControl)
+                    Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
+                    [System.IO.File]::SetAccessControl($stage.ConfigPath, $stage.AccessControl)
                 }
                 else {
                     Remove-Item -Force -LiteralPath $stage.ConfigPath
@@ -413,13 +422,18 @@ function Commit-HookChanges {
         try {
             [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.AfterPath))
             if ($stage.Existed) {
-                # Unlike Move-Item -Force, File.Replace retains the destination ACL.
-                [System.IO.File]::Replace($temporary, $stage.ConfigPath, $null)
+                [System.IO.File]::SetAccessControl($temporary, $stage.AccessControl)
+                Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
+                # Move-Item can re-inherit the parent DACL while replacing a file.
+                # Mark the byte replacement committed before restoring the captured
+                # DACL so an access-control failure participates in rollback.
+                $stage.Committed = $true
+                [System.IO.File]::SetAccessControl($stage.ConfigPath, $stage.AccessControl)
             }
             else {
                 Move-Item -LiteralPath $temporary -Destination $stage.ConfigPath
+                $stage.Committed = $true
             }
-            $stage.Committed = $true
         }
         catch {
             if (Test-PathEntry $temporary) { Remove-Item -Force -LiteralPath $temporary -ErrorAction SilentlyContinue }
