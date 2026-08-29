@@ -102,7 +102,10 @@ unless fetching on every matching session is intended.
 Locks are directories inside the catalog instance. A live owner is never displaced. Incomplete,
 malformed, future-dated, or not-yet-stale ownership is conservatively treated as locked. A dead
 owner is recoverable only after the one-hour default stale interval and an atomic rename/reacquire
-sequence. Unsafe lock path types are skipped without fetching.
+sequence. Unsafe lock path types are skipped without fetching. Explicit removal atomically takes
+the same per-catalog lock before mutation and fails closed if an update already owns it. Retry after
+the update completes; for a dead well-formed lock, run `update-all` after the stale interval to
+recover it before retrying removal. Do not manually recursively delete a lock directory.
 
 Hook execution does not imply that a product waits for its skill scan. A completed update may be
 visible only in the next session. Team Skills does not emit Claude Code's synchronous

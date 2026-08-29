@@ -8,6 +8,7 @@ product and refuses to prepare over an existing path.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -22,6 +23,7 @@ from typing import Any
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_TEMPLATE = REPOSITORY_ROOT / "docs" / "manual-results-template.md"
 FIXTURE_SCHEMA = 1
+MAX_METADATA_BYTES = 1024 * 1024
 
 
 class FixtureError(RuntimeError):
@@ -34,6 +36,8 @@ def safe_absolute_path(value: str) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
         raise FixtureError("fixture root must be an absolute path")
+    if path.is_symlink():
+        raise FixtureError("fixture root must not be a symlink or reparse point")
     resolved = path.resolve()
     if resolved == Path(resolved.anchor):
         raise FixtureError("fixture root must not be a filesystem root")
@@ -194,13 +198,110 @@ def powershell_exports(environment: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def load_fixture(root: Path) -> dict[str, Any]:
-    metadata_path = root / "fixture.json"
-    if not metadata_path.is_file():
-        raise FixtureError(f"not a prepared fixture: {metadata_path}")
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if metadata.get("schema_version") != FIXTURE_SCHEMA or Path(metadata.get("root", "")) != root:
+def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise FixtureError(f"fixture ownership metadata has duplicate key {key!r}")
+        value[key] = item
+    return value
+
+
+def require_mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise FixtureError(f"fixture ownership metadata {label} is invalid")
+    return value
+
+
+def require_owned_path(
+    value: Any, expected: Path, label: str, *, directory: bool, allow_missing: bool = False
+) -> Path:
+    if not isinstance(value, str) or any(character in value for character in "\n\r\t"):
+        raise FixtureError(f"fixture ownership metadata {label} is invalid")
+    path = Path(value)
+    if path != expected or not path.is_absolute() or path.is_symlink():
+        raise FixtureError(f"fixture ownership metadata {label} is outside the owned fixture")
+    if allow_missing and not path.exists():
+        if path.resolve(strict=False) != expected:
+            raise FixtureError(f"fixture ownership metadata {label} crosses an unsafe path")
+        return path
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise FixtureError(f"fixture ownership metadata {label} is missing") from error
+    if resolved != expected or (directory and not path.is_dir()) or (not directory and not path.is_file()):
+        raise FixtureError(f"fixture ownership metadata {label} has an unsafe path type")
+    return path
+
+
+def expected_instance_digests(origin: Path) -> set[str]:
+    encoded = str(origin).encode("utf-8")
+    git_blob = b"blob " + str(len(encoded)).encode("ascii") + b"\0" + encoded
+    return {hashlib.sha1(git_blob).hexdigest(), hashlib.sha256(encoded).hexdigest()}
+
+
+def validate_fixture_metadata(
+    root: Path, metadata: dict[str, Any], *, allow_missing_owned: bool = False
+) -> None:
+    if metadata.get("schema_version") != FIXTURE_SCHEMA or metadata.get("root") != str(root):
         raise FixtureError("fixture ownership metadata is invalid")
+    catalogs = require_mapping(metadata.get("catalogs"), "catalogs")
+    if set(catalogs) != {"first", "second"}:
+        raise FixtureError("fixture ownership metadata catalogs are invalid")
+    instances: set[Path] = set()
+    for catalog in ("first", "second"):
+        entry = require_mapping(catalogs[catalog], f"catalogs.{catalog}")
+        work = require_owned_path(
+            entry.get("work"), root / "catalog-work" / catalog, f"catalogs.{catalog}.work",
+            directory=True, allow_missing=allow_missing_owned,
+        )
+        origin = require_owned_path(
+            entry.get("origin"), root / "catalog-origins" / f"{catalog}.git",
+            f"catalogs.{catalog}.origin", directory=True, allow_missing=allow_missing_owned,
+        )
+        instance_value = entry.get("instance")
+        if not isinstance(instance_value, str):
+            raise FixtureError(f"fixture ownership metadata catalogs.{catalog}.instance is invalid")
+        instance = Path(instance_value)
+        expected_parent = root / "state" / "catalogs"
+        suffix = instance.name.removeprefix("manual-shared-catalog-id-")
+        if (
+            instance.parent != expected_parent
+            or instance.is_symlink()
+            or suffix not in expected_instance_digests(origin)
+        ):
+            raise FixtureError(
+                f"fixture ownership metadata catalogs.{catalog}.instance is outside the owned fixture"
+            )
+        require_owned_path(
+            instance_value, instance, f"catalogs.{catalog}.instance", directory=True,
+            allow_missing=allow_missing_owned,
+        )
+        require_owned_path(
+            str(instance / "repo" / ".git"), instance / "repo" / ".git",
+            f"catalogs.{catalog}.instance Git metadata", directory=True,
+            allow_missing=allow_missing_owned,
+        )
+        require_owned_path(
+            str(work / ".git"), work / ".git", f"catalogs.{catalog}.work Git metadata",
+            directory=True, allow_missing=allow_missing_owned,
+        )
+        instances.add(instance)
+    if len(instances) != 2:
+        raise FixtureError("fixture ownership metadata reuses a managed catalog instance")
+
+
+def load_fixture(root: Path, *, allow_missing_owned: bool = False) -> dict[str, Any]:
+    metadata_path = root / "fixture.json"
+    if not metadata_path.is_file() or metadata_path.is_symlink():
+        raise FixtureError(f"not a prepared fixture: {metadata_path}")
+    if metadata_path.stat().st_size > MAX_METADATA_BYTES:
+        raise FixtureError("fixture ownership metadata is too large")
+    metadata = json.loads(
+        metadata_path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys
+    )
+    metadata = require_mapping(metadata, "root")
+    validate_fixture_metadata(root, metadata, allow_missing_owned=allow_missing_owned)
     return metadata
 
 
@@ -351,6 +452,14 @@ def show(root: Path) -> None:
     print(json.dumps(metadata, indent=2))
 
 
+def cleanup_fixture(root: Path) -> None:
+    # Product-check removal may already have deleted managed instances. Their exact metadata paths
+    # must remain fixture-scoped, but cleanup does not require those owned children to still exist.
+    load_fixture(root, allow_missing_owned=True)
+    shutil.rmtree(root)
+    print(f"Removed validated disposable fixture only: {root}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -366,6 +475,10 @@ def parse_args() -> argparse.Namespace:
     origin_parser.add_argument("mode", choices=("unreachable", "restore"))
     show_parser = subparsers.add_parser("show", help="print fixture paths and expected values")
     show_parser.add_argument("root", help="prepared absolute fixture path")
+    cleanup_parser = subparsers.add_parser(
+        "cleanup", help="validate ownership and remove only the prepared fixture root"
+    )
+    cleanup_parser.add_argument("root", help="prepared absolute fixture path")
     return parser.parse_args()
 
 
@@ -379,8 +492,10 @@ def main() -> int:
             advance(root, args.catalog, args.marker)
         elif args.action == "origin":
             set_origin(root, args.catalog, args.mode)
-        else:
+        elif args.action == "show":
             show(root)
+        else:
+            cleanup_fixture(root)
     except (FixtureError, OSError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

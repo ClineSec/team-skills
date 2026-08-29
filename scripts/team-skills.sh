@@ -141,6 +141,39 @@ require_instance_layout() {
     require_owned_directory "$layout_root/installs" "catalog installation state"
 }
 
+acquire_removal_lock() {
+    REMOVAL_LOCK=$INSTANCE_ROOT/update.lock
+    if ! mkdir "$REMOVAL_LOCK" 2>/dev/null; then
+        die "catalog update is in progress; retry removal after it completes"
+    fi
+    removal_lock_time=$(date +%s) || {
+        rmdir "$REMOVAL_LOCK" 2>/dev/null || :
+        die "cannot timestamp catalog removal lock"
+    }
+    REMOVAL_LOCK_CONTENT="$$
+$removal_lock_time"
+    if ! printf '%s\n' "$REMOVAL_LOCK_CONTENT" >"$REMOVAL_LOCK/owner"; then
+        rmdir "$REMOVAL_LOCK" 2>/dev/null || :
+        die "cannot record catalog removal lock ownership"
+    fi
+}
+
+release_removal_lock() {
+    [ -n "${REMOVAL_LOCK:-}" ] || return 0
+    [ -d "$REMOVAL_LOCK" ] && [ ! -L "$REMOVAL_LOCK" ] || return 0
+    [ -f "$REMOVAL_LOCK/owner" ] && [ ! -L "$REMOVAL_LOCK/owner" ] || return 0
+    [ "$(cat "$REMOVAL_LOCK/owner" 2>/dev/null || :)" = "$REMOVAL_LOCK_CONTENT" ] || return 0
+    lock_entries=0
+    for lock_entry in "$REMOVAL_LOCK"/* "$REMOVAL_LOCK"/.[!.]* "$REMOVAL_LOCK"/..?*; do
+        [ -e "$lock_entry" ] || [ -L "$lock_entry" ] || continue
+        lock_entries=$((lock_entries + 1))
+        [ "$lock_entry" = "$REMOVAL_LOCK/owner" ] || return 0
+    done
+    [ "$lock_entries" -eq 1 ] || return 0
+    rm "$REMOVAL_LOCK/owner" 2>/dev/null && rmdir "$REMOVAL_LOCK" 2>/dev/null || :
+    REMOVAL_LOCK=
+}
+
 shell_quote() {
     printf "'"
     printf '%s' "$1" | sed "s/'/'\\\\''/g"
@@ -564,6 +597,7 @@ require_owned_directory "$STATE_ROOT/origins" "catalog origin index root"
 WORK_ROOT=$(mktemp -d "$STATE_ROOT/.operation.XXXXXXXX") || die "cannot create temporary state"
 cleanup() {
     rollback_transaction
+    release_removal_lock
     if [ -n "${CANDIDATE_WORKTREE:-}" ] && [ -n "${MANAGED_REPO:-}" ]; then
         git -C "$MANAGED_REPO" worktree remove --force "$CANDIDATE_WORKTREE" >/dev/null 2>&1 || :
     fi
@@ -907,6 +941,12 @@ if [ "$ACTION" = remove ]; then
         printf '%s\n' "Catalog $CATALOG_ID prefix '$PREFIX' is already absent."
         exit 0
     }
+    # Removal and session-start reconciliation mutate the same generation, exposure, and hook
+    # state. Winning this atomic directory creation excludes a later updater; an existing lock
+    # fails closed before removal mutates anything.
+    acquire_removal_lock
+    require_instance_layout "$INSTANCE_ROOT"
+    [ -d "$INSTALL_ROOT" ] && [ ! -L "$INSTALL_ROOT" ] || die "installed prefix state changed during removal"
     remaining_install=0
     for installed_view in "$INSTANCE_ROOT/installs"/*; do
         [ -d "$installed_view" ] && [ ! -L "$installed_view" ] || continue

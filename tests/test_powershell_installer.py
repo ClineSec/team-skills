@@ -726,6 +726,24 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertFalse(lock.exists())
 
+    def test_remove_refuses_active_update_lock_before_mutation(self) -> None:
+        _, origin = self.make_catalog("remove-locked", "# Initial")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = next((self.state / "catalogs").iterdir())
+        lock = instance / "update.lock"
+        lock.mkdir()
+        (lock / "owner").write_text(f"{os.getpid()}\n2000000000\n", encoding="utf-8")
+        hook_paths = (self.claude_hooks, self.codex_hooks, self.cursor_hooks)
+        hooks_before = [path.read_bytes() for path in hook_paths]
+
+        refused = self.run_installer("remove", origin)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("catalog update is in progress", refused.stderr)
+        self.assertTrue(instance.is_dir())
+        self.assertTrue((self.agents / "common-skill").exists())
+        self.assertTrue(lock.is_dir())
+        self.assertEqual([path.read_bytes() for path in hook_paths], hooks_before)
+
     def test_hook_masks_fetch_failure_and_writes_credential_safe_log(self) -> None:
         _, origin = self.make_catalog("hook-failure", "# Known good")
         self.assertEqual(self.run_installer("install", origin).returncode, 0)

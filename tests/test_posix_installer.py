@@ -956,6 +956,35 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertEqual(locked.returncode, 0, locked.stderr)
         self.assertTrue(lock.is_dir())
 
+    def test_remove_refuses_active_update_lock_before_mutation(self) -> None:
+        _, origin = self.make_catalog("remove-locked", "# Initial")
+        self.assertEqual(self.run_installer("install", origin).returncode, 0)
+        instance = self.instance_root()
+        lock = instance / "update.lock"
+        lock.mkdir()
+        (lock / "owner").write_text(f"{os.getpid()}\n2000000000\n", encoding="utf-8")
+        exposure = self.agents / "common-skill"
+        hooks_before = {
+            product: path.read_bytes()
+            for product, path in {
+                "claude": self.home / ".claude" / "settings.json",
+                "codex": self.home / ".codex" / "hooks.json",
+                "cursor": self.home / ".cursor" / "hooks.json",
+            }.items()
+        }
+
+        refused = self.run_installer("remove", origin)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("catalog update is in progress", refused.stderr)
+        self.assertTrue(instance.is_dir())
+        self.assertTrue(exposure.is_symlink())
+        self.assertTrue(lock.is_dir())
+        for product, expected in hooks_before.items():
+            self.assertEqual(
+                (self.home / f".{product}" / ("settings.json" if product == "claude" else "hooks.json")).read_bytes(),
+                expected,
+            )
+
     def test_stale_lock_recovers_conservatively(self) -> None:
         _, origin = self.make_catalog("stale", "# Initial")
         installed = self.run_installer("install", origin)

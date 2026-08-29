@@ -160,25 +160,24 @@ only its owned exposures, hook entries, and instance state are removed.
 ## Cleanup
 
 Close every product launched with the disposable environment. Review `RESULTS.md` and copy only
-sanitized evidence that must be retained. Confirm `fixture.json` reports the exact expected root.
-Then delete only `$TEAM_SKILLS_MANUAL_PARENT` on POSIX or `$TeamSkillsManualParent` on Windows. Do
-not delete a normal home, product configuration directory, or any parent of the generated fixture.
-No service, scheduled task, cron entry, plugin, wrapper, or machine-wide artifact was installed.
+sanitized evidence that must be retained. Do not retain the managed clone's Git configuration: it
+temporarily contains the inert test credential strings while origin mode is `unreachable`. The
+helper validates `fixture.json`, rejects redirected/linked owned paths, and removes only the exact
+fixture root. It never recursively deletes the temporary parent, a normal home, or a product
+configuration directory. No service, scheduled task, cron entry, plugin, wrapper, or machine-wide
+artifact was installed.
 
-After visually confirming the printed variable is the dedicated temporary parent created above,
-the scoped cleanup commands are:
+Use the ownership-validating cleanup command, then remove the now-empty parent non-recursively:
 
 ```sh
-test -f "$TEAM_SKILLS_MANUAL_ROOT/fixture.json"
-printf 'Deleting disposable fixture only: %s\n' "$TEAM_SKILLS_MANUAL_PARENT"
-rm -rf -- "$TEAM_SKILLS_MANUAL_PARENT"
+python3 scripts/prepare-manual-verification.py cleanup "$TEAM_SKILLS_MANUAL_ROOT"
+rmdir -- "$TEAM_SKILLS_MANUAL_PARENT"
 unset TEAM_SKILLS_MANUAL_PARENT TEAM_SKILLS_MANUAL_ROOT
 ```
 
 ```powershell
-if (-not (Test-Path -LiteralPath (Join-Path $TeamSkillsManualRoot "fixture.json"))) { throw "Fixture marker missing" }
-Write-Host "Deleting disposable fixture only: $TeamSkillsManualParent"
-Remove-Item -LiteralPath $TeamSkillsManualParent -Recurse -Force
+python scripts/prepare-manual-verification.py cleanup $TeamSkillsManualRoot
+Remove-Item -LiteralPath $TeamSkillsManualParent
 Remove-Variable TeamSkillsManualParent, TeamSkillsManualRoot
 ```
 

@@ -45,6 +45,8 @@ $script:RemovalOriginalPath = $null
 $script:RemovalOriginRemoved = $false
 $script:RemovalOriginIndex = $null
 $script:RemovalInstanceKey = $null
+$script:RemovalLockRoot = $null
+$script:RemovalLockContent = $null
 
 function Fail([string]$Message) {
     throw [System.InvalidOperationException]::new($Message)
@@ -934,6 +936,52 @@ function Test-OwnedUpdateLock([string]$LockRoot, [long]$Now) {
     catch { return $false }
 }
 
+function Enter-RemovalLock([string]$InstanceRoot) {
+    $lockRoot = Join-Path $InstanceRoot "update.lock"
+    try {
+        $null = New-Item -ItemType Directory -Path $lockRoot -ErrorAction Stop
+    }
+    catch {
+        Fail "catalog update is in progress; retry removal after it completes"
+    }
+    $lockContent = (
+        [System.Diagnostics.Process]::GetCurrentProcess().Id.ToString() +
+        [Environment]::NewLine + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString() +
+        [Environment]::NewLine
+    )
+    try {
+        [System.IO.File]::WriteAllText(
+            (Join-Path $lockRoot "owner"), $lockContent, [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+    catch {
+        Remove-Item -LiteralPath $lockRoot -ErrorAction SilentlyContinue
+        Fail "cannot record catalog removal lock ownership"
+    }
+    $script:RemovalLockRoot = $lockRoot
+    $script:RemovalLockContent = $lockContent
+}
+
+function Exit-RemovalLock {
+    if ($null -eq $script:RemovalLockRoot -or -not (Test-PathEntry $script:RemovalLockRoot)) {
+        return
+    }
+    try {
+        $lockItem = Get-Item -Force -LiteralPath $script:RemovalLockRoot
+        $entries = @(Get-ChildItem -Force -LiteralPath $script:RemovalLockRoot)
+        if (-not ($lockItem -is [System.IO.DirectoryInfo]) -or (Test-ReparsePoint $lockItem) -or
+                $entries.Count -ne 1 -or $entries[0].Name -cne "owner" -or
+                -not ($entries[0] -is [System.IO.FileInfo]) -or (Test-ReparsePoint $entries[0]) -or
+                [System.IO.File]::ReadAllText($entries[0].FullName) -cne $script:RemovalLockContent) {
+            return
+        }
+        Remove-Item -Force -LiteralPath $entries[0].FullName -ErrorAction Stop
+        Remove-Item -LiteralPath $script:RemovalLockRoot -ErrorAction Stop
+        $script:RemovalLockRoot = $null
+    }
+    catch { }
+}
+
 function Invoke-CatalogUpdate([string]$InstanceKey) {
     if (-not (Test-InstanceKey $InstanceKey)) {
         Write-UpdateDiagnostic "error: invalid catalog instance key"
@@ -1440,6 +1488,12 @@ try {
             Write-Output "Catalog $($manifest.catalog_id) prefix '$Prefix' is already absent."
             exit 0
         }
+        # Explicit removal and session-start reconciliation mutate the same catalog-owned state.
+        # Atomic lock creation makes an existing updater a fail-closed, pre-mutation error.
+        Enter-RemovalLock $instanceRoot
+        Assert-InstanceLayout $instanceRoot
+        if (-not (Test-PathEntry $installRoot)) { Fail "installed prefix state changed during removal" }
+        Assert-OwnedDirectory $installRoot "catalog installation view"
         $remainingInstall = @(
             Get-ChildItem -Force -LiteralPath (Join-Path $instanceRoot 'installs') | Where-Object {
                 $_ -is [System.IO.DirectoryInfo] -and -not (Test-ReparsePoint $_) -and
@@ -1685,6 +1739,7 @@ finally {
         $captured = ""
         $null = Invoke-Git @('-C', $ManagedRepo, 'worktree', 'remove', '--force', $CandidateWorktree) ([ref]$captured)
     }
+    Exit-RemovalLock
     if ($null -ne $WorkRoot -and (Test-PathEntry $WorkRoot)) {
         Remove-Item -Recurse -Force -LiteralPath $WorkRoot
     }

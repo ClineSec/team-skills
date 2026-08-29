@@ -36,7 +36,8 @@ fast-forward-only history, ordinary-file and
 reparse-point checks at every catalog-owned directory boundary, collision no-clobber semantics,
 immutable generations, atomic current-view activation, exact ownership records, staged hook
 merges, bounded atomic logs with UTF-8-safe truncation, and rollback after late install or removal
-failures. Removal preflights every ownership entry as an ordinary, canonical file before changing
+failures. Removal first takes the updater's per-catalog lock, then preflights every ownership entry
+as an ordinary, canonical file before changing
 hooks or exposures, then atomically stages catalog state so an interrupted operation can restore
 already-removed links without overwriting a racing user path. A future
 success timestamp is treated as invalid throttle evidence rather than suppressing updates.
@@ -54,7 +55,9 @@ changed owned commands; linked canonical content; linked, malformed, or noncanon
 ownership records; missing or malformed lifecycle files; invalid catalog identity or names; any
 configured-origin identity change, including a fast-forward mirror;
 credential-bearing fetch failures; future throttle timestamps; unexpected lock contents; and
-non-fast-forward, downgrade, or unrelated history.
+non-fast-forward, downgrade, or unrelated history. Removal is also rejected before mutation while
+an update lock exists. The manual-fixture helper rejects duplicate ownership keys and any catalog
+work, origin, instance, or Git-metadata path that does not resolve to its exact fixture-owned path.
 
 ## Residual risks and ownership
 

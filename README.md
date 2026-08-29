@@ -133,7 +133,8 @@ and foreign product configuration are outside that removal boundary. Removing a 
 keeps the catalog updater. Removing the final prefix removes only hook entries whose recorded
 configuration path and exact command still prove catalog ownership, then removes that catalog's
 managed clone, hook ownership state, and origin index. If a catalog-owned hook was edited, removal
-refuses safely so the installation can be inspected and retried.
+refuses safely so the installation can be inspected and retried. Removal also takes the catalog's
+update lock and refuses before mutation when a session-start reconciliation is already in progress.
 
 ## State and failure behavior
 

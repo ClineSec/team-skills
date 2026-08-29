@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -80,6 +81,39 @@ class ManualFixtureTests(unittest.TestCase):
 
             # The process environment and normal home remain outside the fixture helper's scope.
             self.assertNotEqual(Path(os.environ.get("HOME", parent)).resolve(), fixture / "home")
+            # Final manual removal legitimately deletes managed instance paths before cleanup.
+            shutil.rmtree(fixture / "state" / "catalogs")
+            cleaned = self.run_helper("cleanup", str(fixture))
+            self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
+            self.assertFalse(fixture.exists())
+            self.assertTrue(parent.is_dir())
+
+    def test_mutated_or_ambiguous_ownership_metadata_cannot_redirect_operations(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="team skills manual ownership ") as temporary:
+            parent = Path(temporary)
+            fixture = parent / "fixture"
+            prepared = self.run_helper("prepare", str(fixture))
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            metadata_path = fixture / "fixture.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            original_work = Path(metadata["catalogs"]["first"]["work"])
+            original_skill = original_work / "skills" / "common-skill" / "SKILL.md"
+            original_bytes = original_skill.read_bytes()
+
+            metadata["catalogs"]["first"]["work"] = metadata["catalogs"]["second"]["work"]
+            metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+            redirected = self.run_helper("advance", str(fixture), "first", "redirected")
+            self.assertEqual(redirected.returncode, 2)
+            self.assertIn("outside the owned fixture", redirected.stderr)
+            self.assertEqual(original_skill.read_bytes(), original_bytes)
+
+            duplicate = metadata_path.read_text(encoding="utf-8").replace(
+                '"schema_version": 1,', '"schema_version": 1,\n  "schema_version": 1,', 1
+            )
+            metadata_path.write_text(duplicate, encoding="utf-8")
+            ambiguous = self.run_helper("show", str(fixture))
+            self.assertEqual(ambiguous.returncode, 2)
+            self.assertIn("duplicate key 'schema_version'", ambiguous.stderr)
 
 
 if __name__ == "__main__":
