@@ -102,21 +102,8 @@ class PowerShellInstallerTests(unittest.TestCase):
         )
 
     def remove_junction(self, path: Path) -> None:
-        assert POWERSHELL
-        result = subprocess.run(
-            [
-                POWERSHELL,
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[IO.Directory]::Delete($args[0])",
-                str(path),
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        # os.rmdir maps to RemoveDirectoryW and removes the junction, not its target.
+        os.rmdir(path)
 
     def test_two_origins_collision_prefix_idempotence_and_safe_remove(self) -> None:
         _, first_origin = self.make_catalog("first", "# First catalog")
