@@ -66,14 +66,14 @@ The commit must be a fast-forward from the managed clone's current revision.
 | Cursor | `~/.cursor/hooks.json` | `sessionStart` only |
 
 Claude Code updates run for a new session and after `/clear`, not for resume or compact. Codex
-fresh-session startup is verified, but Codex CLI 0.149.1 did not emit the active `SessionStart`
-hook after `/clear`; start a new Codex process when an update boundary is needed. The installed
-Codex matcher retains `clear` for versions that emit it, but Team Skills does not promise that
-behavior. Codex requires the user to review and trust a non-managed hook before it will run; a
-newly installed or changed Team Skills hook can therefore be skipped until accepted. Cursor defines
-`sessionStart` as creation of a new composer conversation and runs it fire-and-forget. Team Skills
-does not install Cursor's separate `workspaceOpen` event. Cursor user-level hooks are local-only and
-are not available in Cursor cloud agents.
+fresh-session startup is verified, but Codex CLI 0.149.1 and 0.151.0 did not emit the active
+`SessionStart` hook after `/clear`; start a new Codex process when an update boundary is needed.
+The installed Codex matcher retains `clear` for versions that emit it, but Team Skills does not
+promise that behavior. Codex requires the user to review and trust a non-managed hook before it
+will run; a newly installed or changed Team Skills hook can therefore be skipped until accepted.
+Cursor defines `sessionStart` as creation of a new composer conversation and runs it
+fire-and-forget. Team Skills does not install Cursor's separate `workspaceOpen` event. Cursor
+user-level hooks are local-only and are not available in Cursor cloud agents.
 
 The default throttle is six hours per catalog, measured from the last completely successful update.
 An update skipped by that throttle or by an already-held catalog lock does no network fetch and
