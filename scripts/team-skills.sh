@@ -142,10 +142,11 @@ require_instance_layout() {
 }
 
 acquire_removal_lock() {
-    REMOVAL_LOCK=$INSTANCE_ROOT/update.lock
-    if ! mkdir "$REMOVAL_LOCK" 2>/dev/null; then
+    removal_lock_path=$INSTANCE_ROOT/update.lock
+    if ! mkdir "$removal_lock_path" 2>/dev/null; then
         die "catalog update is in progress; retry removal after it completes"
     fi
+    REMOVAL_LOCK=$removal_lock_path
     removal_lock_time=$(date +%s) || {
         rmdir "$REMOVAL_LOCK" 2>/dev/null || :
         die "cannot timestamp catalog removal lock"
