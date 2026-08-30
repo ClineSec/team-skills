@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -82,7 +81,7 @@ class ManualFixtureTests(unittest.TestCase):
             # The process environment and normal home remain outside the fixture helper's scope.
             self.assertNotEqual(Path(os.environ.get("HOME", parent)).resolve(), fixture / "home")
             # Final manual removal legitimately deletes managed instance paths before cleanup.
-            shutil.rmtree(fixture / "state" / "catalogs")
+            (fixture / "state" / "catalogs").rename(fixture / "state" / "removed-catalogs")
             cleaned = self.run_helper("cleanup", str(fixture))
             self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
             self.assertFalse(fixture.exists())

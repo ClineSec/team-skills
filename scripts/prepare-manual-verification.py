@@ -13,6 +13,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -456,7 +457,13 @@ def cleanup_fixture(root: Path) -> None:
     # Product-check removal may already have deleted managed instances. Their exact metadata paths
     # must remain fixture-scoped, but cleanup does not require those owned children to still exist.
     load_fixture(root, allow_missing_owned=True)
-    shutil.rmtree(root)
+    def remove_readonly(function: Any, path: str, _: Any) -> None:
+        # Git for Windows creates read-only object files. Clear only that leaf's write bit after
+        # rmtree has already selected it beneath the validated fixture root, then retry once.
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
+
+    shutil.rmtree(root, onerror=remove_readonly)
     print(f"Removed validated disposable fixture only: {root}")
 
 
