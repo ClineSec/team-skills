@@ -23,7 +23,7 @@ before/after evidence. Never include repository credentials or a managed clone's
 | Claude Code `/clear`; no resume/compact update | `<VERSION>` | PENDING | `<PATH_OR_NOTE>` | `<NOTES>` |
 | Claude Code fail-open, last-known-good, safe log, retry | `<VERSION>` | PENDING | `<PATH_OR_NOTE>` | `<NOTES>` |
 | Codex hook review/trust + startup + following-session visibility | `<VERSION>` | PENDING | `<PATH_OR_NOTE>` | `<NOTES>` |
-| Codex `/clear`; no resume/compact update | `<VERSION>` | PENDING | `<PATH_OR_NOTE>` | `<NOTES>` |
+| Codex `/clear` capability; no resume/compact update | `<VERSION>` | PENDING | `<PATH_OR_NOTE>` | Record unsupported/version-gap separately from startup |
 | Codex fail-open, last-known-good, safe log, retry | `<VERSION>` | PENDING | `<PATH_OR_NOTE>` | `<NOTES>` |
 | Cursor new local conversation; following-conversation visibility | `<VERSION>` | PENDING | `<PATH_OR_NOTE>` | `<NOTES>` |
 | Cursor workspace open/change does not update | `<VERSION>` | PENDING | `<PATH_OR_NOTE>` | `<NOTES>` |

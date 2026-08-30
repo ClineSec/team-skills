@@ -27,6 +27,8 @@ The registered lifecycle choices follow the first-party hook references reviewed
 - Claude Code: user-level `SessionStart` with `startup|clear`, and an asynchronous command handler.
   `resume`, `compact`, and `fork` are intentionally excluded.
 - Codex: user-level `SessionStart` with `startup|clear`, and an asynchronous command handler.
+  Fresh-process startup is the verified update boundary; authenticated Codex CLI 0.149.1 did not
+  emit the active hook after `/clear`, so that event is version-dependent rather than guaranteed.
   `resume` and `compact` are intentionally excluded. Codex must trust the exact non-managed hook
   definition before it runs.
 - Cursor: user-level `sessionStart`, which fires for a new composer conversation and is

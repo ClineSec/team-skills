@@ -126,10 +126,14 @@ session.
 1. Review the newly discovered non-managed Team Skills hook and explicitly trust its exact
    definition. Record that step; Codex skips it until trusted and requires renewed review if its
    hash changes.
-2. Advance with `codex-startup`, start a new local session, then advance with `codex-clear` and use `/clear`.
-   Confirm both eventually update without delaying startup.
-3. Capture timestamps, resume and compact separately, and confirm neither starts an update.
-4. Set the origin `unreachable` and start fresh. Then set it to `restore`, advance with
+2. Advance with `codex-startup`, start a new local session, and confirm it eventually updates
+   without delaying startup.
+3. As a version-specific capability check, advance with `codex-clear` and use `/clear`. Record a
+   pass only if the updater evidence changes. Codex CLI 0.149.1 did not emit the active
+   `SessionStart` hook for this event during authenticated macOS verification; classify that result
+   as a product-version gap and use a fresh process as the reliable update boundary.
+4. Capture timestamps, resume and compact separately, and confirm neither starts an update.
+5. Set the origin `unreachable` and start fresh. Then set it to `restore`, advance with
    `codex-retry`, and start fresh again. Confirm fail-open behavior, last-known-good retention, a
    log without either inert credential string, and clean retry.
 
