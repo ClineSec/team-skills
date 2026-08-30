@@ -228,12 +228,54 @@ prepare_hook_edit() {
         : >"$hook_existed"
     else
         printf '{}\n' >"$hook_before"
+        if [ "$hook_operation" = add ]; then : >"$hook_stage/config-created"; fi
     fi
-    if ! TEAM_SKILLS_JSON_COMMAND=$hook_command LC_ALL=C awk -v operation="$hook_operation" -v product="$hook_product" \
+    if [ "$hook_operation" = add ] && [ "$hook_product" = cursor ] && \
+            ! LC_ALL=C awk -v operation=cursor-version -f "$HOOK_EDITOR" "$hook_before" >/dev/null 2>&1; then
+        : >"$hook_stage/cursor-version-created"
+    fi
+    if ! TEAM_SKILLS_JSON_COMMAND=$hook_command \
+        TEAM_SKILLS_JSON_REMOVE_CURSOR_VERSION=${REMOVE_CURSOR_VERSION:-0} \
+        LC_ALL=C awk -v operation="$hook_operation" -v product="$hook_product" \
         -f "$HOOK_EDITOR" "$hook_before" >"$hook_after"; then
         rm -f "$hook_after"
         die "$hook_product hook configuration is malformed, unsupported, or no longer owned"
     fi
+}
+
+inherit_hook_config_creation() {
+    inherited_product=$1
+    inherited_config=$2
+    for inherited_owner in "$STATE_ROOT"/catalogs/*/hooks/$inherited_product.owner; do
+        [ -f "$inherited_owner" ] && [ ! -L "$inherited_owner" ] || continue
+        [ "$(sed -n '1p' "$inherited_owner")" = "$inherited_config" ] || continue
+        inherited_flags=$(sed -n '3p' "$inherited_owner")
+        case $inherited_flags in created|config-created|config-created,cursor-version-created) return 0 ;; esac
+    done
+    return 1
+}
+
+inherit_cursor_version_creation() {
+    inherited_config=$1
+    for inherited_owner in "$STATE_ROOT"/catalogs/*/hooks/cursor.owner; do
+        [ -f "$inherited_owner" ] && [ ! -L "$inherited_owner" ] || continue
+        [ "$(sed -n '1p' "$inherited_owner")" = "$inherited_config" ] || continue
+        inherited_flags=$(sed -n '3p' "$inherited_owner")
+        case $inherited_flags in cursor-version-created|config-created,cursor-version-created) return 0 ;; esac
+    done
+    return 1
+}
+
+other_hook_owner_exists() {
+    owned_product=$1
+    owned_config=$2
+    current_owner=$3
+    for candidate_owner in "$STATE_ROOT"/catalogs/*/hooks/$owned_product.owner; do
+        [ "$candidate_owner" != "$current_owner" ] || continue
+        [ -f "$candidate_owner" ] && [ ! -L "$candidate_owner" ] || continue
+        [ "$(sed -n '1p' "$candidate_owner")" = "$owned_config" ] && return 0
+    done
+    return 1
 }
 
 prepare_hook_registration() {
@@ -253,6 +295,12 @@ prepare_hook_registration() {
             die "$hook_product hook ownership state is invalid"
         fi
         prepare_hook_edit add "$hook_product" "$hook_config" "$HOOK_COMMAND"
+        if inherit_hook_config_creation "$hook_product" "$hook_config"; then
+            : >"$WORK_ROOT/hooks/$hook_product/config-created"
+        fi
+        if [ "$hook_product" = cursor ] && inherit_cursor_version_creation "$hook_config"; then
+            : >"$WORK_ROOT/hooks/$hook_product/cursor-version-created"
+        fi
     done
     HOOK_CHANGES_PREPARED=1
 }
@@ -270,10 +318,31 @@ prepare_hook_removal() {
         [ -f "$hook_owner" ] && [ ! -L "$hook_owner" ] || die "$hook_product hook ownership state is invalid"
         hook_config=$(sed -n '1p' "$hook_owner")
         hook_command=$(sed -n '2p' "$hook_owner")
+        hook_creation=$(sed -n '3p' "$hook_owner")
+        case $hook_creation in ''|created|config-created|cursor-version-created|config-created,cursor-version-created) ;;
+            *) die "$hook_product hook ownership state is invalid" ;;
+        esac
+        [ -z "$(sed -n '4p' "$hook_owner")" ] || die "$hook_product hook ownership state is invalid"
         reject_unsafe_root "$hook_config" "$hook_product owned hook configuration path"
         expected_command="sh $(shell_quote "$MANAGED_REPO/scripts/team-skills.sh") hook $(shell_quote "$INSTANCE_KEY")"
         [ "$hook_command" = "$expected_command" ] || die "$hook_product hook ownership command no longer matches its target"
+        REMOVE_CURSOR_VERSION=0
+        case $hook_creation in
+            cursor-version-created|config-created,cursor-version-created)
+                if ! other_hook_owner_exists "$hook_product" "$hook_config" "$hook_owner"; then
+                    REMOVE_CURSOR_VERSION=1
+                fi
+                ;;
+        esac
         prepare_hook_edit remove "$hook_product" "$hook_config" "$hook_command"
+        case $hook_creation in created|config-created|config-created,cursor-version-created)
+            : >"$WORK_ROOT/hooks/$hook_product/config-created"
+            ;;
+        esac
+        case $hook_creation in cursor-version-created|config-created,cursor-version-created)
+            : >"$WORK_ROOT/hooks/$hook_product/cursor-version-created"
+            ;;
+        esac
     done
     HOOK_CHANGES_PREPARED=1
 }
@@ -285,6 +354,15 @@ rollback_hook_changes() {
         hook_stage=$WORK_ROOT/hooks/$hook_product
         [ -f "$hook_stage/committed" ] || continue
         hook_config=$(sed -n '1p' "$hook_stage/path")
+        if [ -f "$hook_stage/deleted" ]; then
+            if [ ! -e "$hook_config" ] && [ ! -L "$hook_config" ]; then
+                hook_restore=$hook_config.team-skills-rollback.$$
+                cp -p "$hook_stage/before.json" "$hook_restore" && mv "$hook_restore" "$hook_config" || hook_rollback_failed=1
+            else
+                hook_rollback_failed=1
+            fi
+            continue
+        fi
         if [ -f "$hook_config" ] && [ ! -L "$hook_config" ] && cmp -s "$hook_config" "$hook_stage/after.json"; then
             if [ -f "$hook_stage/existed" ]; then
                 hook_restore=$hook_config.team-skills-rollback.$$
@@ -328,25 +406,35 @@ commit_hook_changes() {
             rollback_hook_changes || :
             die "cannot create $hook_product configuration directory"
         }
-        hook_temp=$hook_parent/.team-skills-hooks.$$
-        if [ -f "$hook_stage/existed" ]; then
+        if [ "$ACTION" = remove ] && [ -f "$hook_stage/config-created" ] && \
+                LC_ALL=C awk -v operation=empty -v product="$hook_product" \
+                    -f "$HOOK_EDITOR" "$hook_stage/after.json" >/dev/null 2>&1; then
+            rm "$hook_config" || {
+                rollback_hook_changes || :
+                die "cannot remove Team Skills-created $hook_product hook configuration"
+            }
+            : >"$hook_stage/deleted"
+        else
+            hook_temp=$hook_parent/.team-skills-hooks.$$
+            if [ -f "$hook_stage/existed" ]; then
             # Seed the replacement from the staged original so POSIX cp -p carries
             # its mode forward, then replace only the bytes before the atomic move.
-            if ! cp -p "$hook_stage/before.json" "$hook_temp" || \
-                ! cat "$hook_stage/after.json" >"$hook_temp"; then
+                if ! cp -p "$hook_stage/before.json" "$hook_temp" || \
+                    ! cat "$hook_stage/after.json" >"$hook_temp"; then
+                    rm -f "$hook_temp"
+                    rollback_hook_changes || :
+                    die "cannot preserve $hook_product hook configuration metadata"
+                fi
+            elif ! (umask 077; cp "$hook_stage/after.json" "$hook_temp"); then
                 rm -f "$hook_temp"
                 rollback_hook_changes || :
-                die "cannot preserve $hook_product hook configuration metadata"
+                die "cannot create secure $hook_product hook configuration"
             fi
-        elif ! (umask 077; cp "$hook_stage/after.json" "$hook_temp"); then
-            rm -f "$hook_temp"
-            rollback_hook_changes || :
-            die "cannot create secure $hook_product hook configuration"
-        fi
-        if ! mv "$hook_temp" "$hook_config"; then
-            rm -f "$hook_temp"
-            rollback_hook_changes || :
-            die "cannot atomically update $hook_product hook configuration"
+            if ! mv "$hook_temp" "$hook_config"; then
+                rm -f "$hook_temp"
+                rollback_hook_changes || :
+                die "cannot atomically update $hook_product hook configuration"
+            fi
         fi
         : >"$hook_stage/committed"
     done
@@ -368,8 +456,17 @@ finalize_hook_ownership() {
         hook_config=$(hook_config_path "$hook_product")
         hook_owner=$HOOK_OWNERSHIP_ROOT/$hook_product.owner
         hook_owner_temp=$HOOK_OWNERSHIP_ROOT/.$hook_product.owner.$$
-        printf '%s\n%s\n' "$hook_config" "$HOOK_COMMAND" >"$hook_owner_temp" && \
-            mv "$hook_owner_temp" "$hook_owner" || die "cannot record $hook_product hook ownership"
+        if [ -f "$WORK_ROOT/hooks/$hook_product/config-created" ] && \
+                [ -f "$WORK_ROOT/hooks/$hook_product/cursor-version-created" ]; then
+            printf '%s\n%s\nconfig-created,cursor-version-created\n' "$hook_config" "$HOOK_COMMAND" >"$hook_owner_temp"
+        elif [ -f "$WORK_ROOT/hooks/$hook_product/config-created" ]; then
+            printf '%s\n%s\nconfig-created\n' "$hook_config" "$HOOK_COMMAND" >"$hook_owner_temp"
+        elif [ -f "$WORK_ROOT/hooks/$hook_product/cursor-version-created" ]; then
+            printf '%s\n%s\ncursor-version-created\n' "$hook_config" "$HOOK_COMMAND" >"$hook_owner_temp"
+        else
+            printf '%s\n%s\n' "$hook_config" "$HOOK_COMMAND" >"$hook_owner_temp"
+        fi
+        mv "$hook_owner_temp" "$hook_owner" || die "cannot record $hook_product hook ownership"
     done
     HOOK_CHANGES_COMMITTED=0
 }

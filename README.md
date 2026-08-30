@@ -135,6 +135,8 @@ configuration path and exact command still prove catalog ownership, then removes
 managed clone, hook ownership state, and origin index. If a catalog-owned hook was edited, removal
 refuses safely so the installation can be inspected and retried. Removal also takes the catalog's
 update lock and refuses before mutation when a session-start reconciliation is already in progress.
+Empty hook containers are pruned. When Team Skills created a product hook file, removing the last
+catalog deletes that file only if no foreign configuration was added; pre-existing files remain.
 
 ## State and failure behavior
 

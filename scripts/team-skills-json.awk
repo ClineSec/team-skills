@@ -480,10 +480,23 @@ function remove_array_index(id, removed_index,    index_value) {
     node_size[id]--
 }
 
-function remove_hook(root,    hooks, event, index_value, child, matches, matched_index) {
+function remove_object_index(id, removed_index,    index_value) {
+    for (index_value = removed_index; index_value < node_size[id]; index_value++) {
+        node_name[id SUBSEP index_value] = node_name[id SUBSEP (index_value + 1)]
+        node_name_raw[id SUBSEP index_value] = node_name_raw[id SUBSEP (index_value + 1)]
+        node_child[id SUBSEP index_value] = node_child[id SUBSEP (index_value + 1)]
+    }
+    delete node_name[id SUBSEP node_size[id]]
+    delete node_name_raw[id SUBSEP node_size[id]]
+    delete node_child[id SUBSEP node_size[id]]
+    node_size[id]--
+}
+
+function remove_hook(root,    hooks, event, event_name, event_index, hooks_index, version_index, version, index_value, child, matches, matched_index) {
     hooks = object_value(root, "hooks")
     if (!hooks || node_kind[hooks] != "object") fail("owned hook container is missing", 3)
-    event = object_value(hooks, product == "cursor" ? "sessionStart" : "SessionStart")
+    event_name = product == "cursor" ? "sessionStart" : "SessionStart"
+    event = object_value(hooks, event_name)
     if (!event || node_kind[event] != "array") fail("owned hook event is missing", 3)
     for (index_value = 1; index_value <= node_size[event]; index_value++) {
         child = node_child[event SUBSEP index_value]
@@ -495,6 +508,30 @@ function remove_hook(root,    hooks, event, index_value, child, matches, matched
     }
     if (matches != 1) fail(matches ? "owned hook entry is ambiguous" : "owned hook entry changed or is missing", 3)
     remove_array_index(event, matched_index)
+    if (!node_size[event]) {
+        event_index = object_index(hooks, event_name)
+        remove_object_index(hooks, event_index)
+        if (!node_size[hooks]) {
+            hooks_index = object_index(root, "hooks")
+            remove_object_index(root, hooks_index)
+        }
+    }
+    if (product == "cursor" && ENVIRON["TEAM_SKILLS_JSON_REMOVE_CURSOR_VERSION"] == "1") {
+        version_index = object_index(root, "version")
+        version = version_index ? node_child[root SUBSEP version_index] : 0
+        if (!version || !literal_equals(version, "1")) fail("owned Cursor hook version changed or is missing", 3)
+        remove_object_index(root, version_index)
+    }
+}
+
+function removable_created_config(root,    version) {
+    if (product == "cursor") {
+        if (node_size[root] == 0) return 1
+        if (node_size[root] != 1) return 0
+        version = object_value(root, "version")
+        return literal_equals(version, "1")
+    }
+    return node_size[root] == 0
 }
 
 function indent(level,    result, index_value) {
@@ -559,9 +596,14 @@ END {
         validate_manifest(root_node)
         exit 0
     }
-    if (operation != "add" && operation != "remove") fail("unsupported operation")
+    if (operation == "cursor-version") {
+        version = object_value(root_node, "version")
+        exit(version && literal_equals(version, "1") ? 0 : 1)
+    }
+    if (operation != "add" && operation != "remove" && operation != "empty") fail("unsupported operation")
     if (product != "claude" && product != "codex" && product != "cursor") fail("unsupported product")
     if (product == "codex") validate_codex_root(root_node)
+    if (operation == "empty") exit(removable_created_config(root_node) ? 0 : 1)
     if (command == "") command = ENVIRON["TEAM_SKILLS_JSON_COMMAND"]
     if (command == "") fail("command must not be blank")
 

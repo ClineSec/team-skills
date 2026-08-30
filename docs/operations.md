@@ -128,6 +128,12 @@ destination whose link/junction target no longer matches its ownership record. R
 expected owned entry or path from a trusted backup, then rerun
 `remove`; do not delete shared configuration files to force removal.
 
+The hook owner records also retain whether Team Skills created the configuration file and whether
+it added Cursor's required version field. That provenance is carried across catalogs sharing the
+same hook file. Final removal prunes empty event/container objects, removes only a version field
+Team Skills added, and deletes a Team Skills-created file only when no foreign configuration
+remains. Late-failure rollback restores a deleted file with its prior access protection.
+
 ## Troubleshooting
 
 ### No automatic update appears

@@ -272,6 +272,7 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertEqual(removed.returncode, 0, removed.stderr)
         for product, path in hook_paths.items():
             value = self.read_hook_config(product)
+            self.assertNotIn("hooks", value)
             if product == "codex":
                 self.assertEqual(value["description"], "private-codex")
             else:
@@ -288,6 +289,16 @@ class PosixInstallerTests(unittest.TestCase):
             self.home / ".cursor" / "hooks.json",
         ):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+        removed = self.run_installer("remove", origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        for product, path in {
+            "claude": self.home / ".claude" / "settings.json",
+            "codex": self.home / ".codex" / "hooks.json",
+            "cursor": self.home / ".cursor" / "hooks.json",
+        }.items():
+            with self.subTest(product=product):
+                self.assertFalse(path.exists())
 
     def test_two_catalog_hook_entries_coexist_and_one_removal_is_exact(self) -> None:
         _, first_origin = self.make_catalog("first-hooks", "# First hooks")
@@ -324,6 +335,15 @@ class PosixInstallerTests(unittest.TestCase):
             serialized = json.dumps(self.read_hook_config(product))
             self.assertNotIn(commands[[key for key in commands if key not in after[1]][0]], serialized)
             self.assertIn(after[1], serialized)
+
+        removed_second = self.run_installer("remove", second_origin, "--prefix", "second")
+        self.assertEqual(removed_second.returncode, 0, removed_second.stderr)
+        self.assertFalse((self.home / ".claude" / "settings.json").exists())
+        self.assertFalse((self.home / ".codex" / "hooks.json").exists())
+        self.assertEqual(
+            self.read_hook_config("cursor"),
+            {"hooks": {"sessionStart": [{"command": "foreign"}]}},
+        )
 
     def test_changed_owned_hook_refuses_removal_and_clean_retry_succeeds(self) -> None:
         _, origin = self.make_catalog("changed-hook", "# Hook ownership")

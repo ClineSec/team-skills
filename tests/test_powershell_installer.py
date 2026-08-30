@@ -324,11 +324,24 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertEqual(removed.returncode, 0, removed.stderr)
         for product, path in hook_paths.items():
             value = self.read_hook_config(product)
+            self.assertNotIn("hooks", value)
             if product == "codex":
                 self.assertEqual(value["description"], "protected-codex")
             else:
                 self.assertEqual(value["foreign"], product)
             self.assertEqual(self.read_acl(path), expected_acls[product])
+
+    def test_new_hook_configs_are_removed_with_the_final_catalog(self) -> None:
+        _, origin = self.make_catalog("new-hook-files", "# New hook files")
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        for path in (self.claude_hooks, self.codex_hooks, self.cursor_hooks):
+            self.assertTrue(path.is_file())
+
+        removed = self.run_installer("remove", origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        for path in (self.claude_hooks, self.codex_hooks, self.cursor_hooks):
+            self.assertFalse(path.exists())
 
     def test_two_catalog_hooks_coexist_and_one_removal_is_exact(self) -> None:
         _, first_origin = self.make_catalog("first-hooks", "# First hooks")
@@ -357,6 +370,15 @@ class PowerShellInstallerTests(unittest.TestCase):
         for product in ("claude", "codex", "cursor"):
             serialized = json.dumps(self.read_hook_config(product))
             self.assertNotIn(commands[next(key for key, value in commands.items() if value not in after)], serialized)
+
+        removed_second = self.run_installer("remove", second_origin, "-Prefix", "second")
+        self.assertEqual(removed_second.returncode, 0, removed_second.stderr)
+        self.assertFalse(self.claude_hooks.exists())
+        self.assertFalse(self.codex_hooks.exists())
+        self.assertEqual(
+            self.read_hook_config("cursor"),
+            {"hooks": {"sessionStart": [{"command": "foreign"}]}},
+        )
 
     def test_malformed_hook_config_refuses_install_without_overwrite(self) -> None:
         _, origin = self.make_catalog("malformed-hooks", "# Hooks")

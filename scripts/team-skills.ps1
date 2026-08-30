@@ -289,7 +289,13 @@ function Test-CodexHookRoot([object]$Root) {
     return $true
 }
 
-function Edit-HookJson([string]$Text, [string]$Operation, [string]$Product, [string]$Command) {
+function Edit-HookJson(
+    [string]$Text,
+    [string]$Operation,
+    [string]$Product,
+    [string]$Command,
+    [bool]$RemoveCursorVersion = $false
+) {
     if (-not (Test-SafeJsonText $Text)) {
         Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
     }
@@ -386,7 +392,22 @@ function Edit-HookJson([string]$Text, [string]$Operation, [string]$Product, [str
         for ($index = 0; $index -lt $event.Count; $index++) {
             if ($index -ne $matches[0]) { $remaining += $event[$index] }
         }
-        $eventProperty.Value = $remaining
+        $eventProperty.Value = @($remaining)
+        if ($remaining.Count -eq 0) {
+            $hooksValue.PSObject.Properties.Remove($eventName)
+            if (@($hooksValue.PSObject.Properties).Count -eq 0) {
+                $root.PSObject.Properties.Remove('hooks')
+            }
+        }
+        if ($Product -ceq 'cursor' -and $RemoveCursorVersion) {
+            $versionProperty = Get-ExactJsonProperty $root 'version'
+            if ($null -eq $versionProperty -or
+                    (($versionProperty.Value -isnot [int] -and $versionProperty.Value -isnot [long]) -or
+                    $versionProperty.Value -ne 1)) {
+                Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+            }
+            $root.PSObject.Properties.Remove('version')
+        }
     }
     else {
         Fail "unsupported hook edit operation"
@@ -431,7 +452,13 @@ function Set-FileAccessSddl([string]$Path, [string]$Sddl) {
     [System.IO.File]::SetAccessControl($Path, $accessControl)
 }
 
-function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigPath, [string]$Command) {
+function Prepare-HookEdit(
+    [string]$Operation,
+    [string]$Product,
+    [string]$ConfigPath,
+    [string]$Command,
+    [bool]$RemoveCursorVersion = $false
+) {
     $stageRoot = Join-Path (Join-Path $WorkRoot 'hooks') $Product
     $null = New-Item -ItemType Directory -Force -Path $stageRoot
     $beforePath = Join-Path $stageRoot 'before.json'
@@ -464,7 +491,12 @@ function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigP
         $beforeText = '{}' + [Environment]::NewLine
         [System.IO.File]::WriteAllText($beforePath, $beforeText, [System.Text.UTF8Encoding]::new($false))
     }
-    $afterText = Edit-HookJson $beforeText $Operation $Product $Command
+    $afterText = Edit-HookJson $beforeText $Operation $Product $Command $RemoveCursorVersion
+    $cursorVersionCreated = $false
+    if ($Operation -ceq 'add' -and $Product -ceq 'cursor') {
+        $beforeRoot = $beforeText | ConvertFrom-Json
+        $cursorVersionCreated = $null -eq (Get-ExactJsonProperty $beforeRoot 'version')
+    }
     [System.IO.File]::WriteAllText($afterPath, $afterText, [System.Text.UTF8Encoding]::new($false))
     $script:HookStages += [PSCustomObject]@{
         Product = $Product
@@ -473,8 +505,65 @@ function Prepare-HookEdit([string]$Operation, [string]$Product, [string]$ConfigP
         AfterPath = $afterPath
         Existed = $existed
         AccessControlSddl = $accessControlSddl
+        ConfigCreated = ($Operation -ceq 'add' -and -not $existed)
+        CursorVersionCreated = $cursorVersionCreated
+        Deleted = $false
         Committed = $false
     }
+}
+
+function Get-InheritedHookFlags([string]$Product, [string]$ConfigPath) {
+    $configCreated = $false
+    $cursorVersionCreated = $false
+    $catalogRoot = Join-Path $StateRoot 'catalogs'
+    if (Test-PathEntry $catalogRoot) {
+        foreach ($catalog in @(Get-ChildItem -Force -Directory -LiteralPath $catalogRoot)) {
+            $ownerPath = Join-Path (Join-Path $catalog.FullName 'hooks') ($Product + '.owner')
+            if (-not (Test-PathEntry $ownerPath)) { continue }
+            $ownerItem = Get-Item -Force -LiteralPath $ownerPath
+            if (-not ($ownerItem -is [System.IO.FileInfo]) -or (Test-ReparsePoint $ownerItem)) { continue }
+            $ownerLines = [System.IO.File]::ReadAllLines($ownerPath)
+            if ($ownerLines.Count -lt 2 -or $ownerLines[0] -cne $ConfigPath) { continue }
+            $flags = if ($ownerLines.Count -ge 3) { $ownerLines[2] } else { '' }
+            if ($flags -in @('created', 'config-created', 'config-created,cursor-version-created')) {
+                $configCreated = $true
+            }
+            if ($flags -in @('cursor-version-created', 'config-created,cursor-version-created')) {
+                $cursorVersionCreated = $true
+            }
+        }
+    }
+    return [PSCustomObject]@{
+        ConfigCreated = $configCreated
+        CursorVersionCreated = $cursorVersionCreated
+    }
+}
+
+function Test-OtherHookOwner([string]$Product, [string]$ConfigPath, [string]$CurrentOwner) {
+    $catalogRoot = Join-Path $StateRoot 'catalogs'
+    if (-not (Test-PathEntry $catalogRoot)) { return $false }
+    foreach ($catalog in @(Get-ChildItem -Force -Directory -LiteralPath $catalogRoot)) {
+        $ownerPath = Join-Path (Join-Path $catalog.FullName 'hooks') ($Product + '.owner')
+        if ($ownerPath -ceq $CurrentOwner -or -not (Test-PathEntry $ownerPath)) { continue }
+        $ownerItem = Get-Item -Force -LiteralPath $ownerPath
+        if (-not ($ownerItem -is [System.IO.FileInfo]) -or (Test-ReparsePoint $ownerItem)) { continue }
+        $ownerLines = [System.IO.File]::ReadAllLines($ownerPath)
+        if ($ownerLines.Count -ge 2 -and $ownerLines[0] -ceq $ConfigPath) { return $true }
+    }
+    return $false
+}
+
+function Test-RemovableCreatedHookConfig([string]$Path, [string]$Product) {
+    try { $root = (Read-Utf8Text $Path) | ConvertFrom-Json }
+    catch { return $false }
+    if ($root -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    $properties = @($root.PSObject.Properties)
+    if ($properties.Count -eq 0) { return $true }
+    if ($Product -cne 'cursor' -or $properties.Count -ne 1 -or $properties[0].Name -cne 'version') {
+        return $false
+    }
+    return ($properties[0].Value -is [int] -or $properties[0].Value -is [long]) -and
+        $properties[0].Value -eq 1
 }
 
 function Prepare-HookRegistration([string]$SourceRoot, [string]$InstanceRoot, [string]$InstanceKey) {
@@ -492,12 +581,22 @@ function Prepare-HookRegistration([string]$SourceRoot, [string]$InstanceRoot, [s
                 Fail "$product hook ownership state is invalid"
             }
             $ownerLines = [System.IO.File]::ReadAllLines($ownerPath)
-            if ($ownerLines.Count -ne 2 -or $ownerLines[0] -cne $configPath -or
+            if ($ownerLines.Count -lt 2 -or $ownerLines.Count -gt 3 -or
+                    $ownerLines[0] -cne $configPath -or
                     $ownerLines[1] -cne $script:HookCommand) {
                 Fail "$product hook ownership path or command changed"
             }
+            if ($ownerLines.Count -eq 3 -and $ownerLines[2] -notin @(
+                    'created', 'config-created', 'cursor-version-created',
+                    'config-created,cursor-version-created')) {
+                Fail "$product hook ownership state is invalid"
+            }
         }
         Prepare-HookEdit 'add' $product $configPath $script:HookCommand
+        $inherited = Get-InheritedHookFlags $product $configPath
+        $stage = $script:HookStages[-1]
+        if ($inherited.ConfigCreated) { $stage.ConfigCreated = $true }
+        if ($inherited.CursorVersionCreated) { $stage.CursorVersionCreated = $true }
     }
 }
 
@@ -517,11 +616,24 @@ function Prepare-HookRemoval([string]$InstanceRoot, [string]$InstanceKey) {
             Fail "$product hook ownership state is invalid"
         }
         $ownerLines = [System.IO.File]::ReadAllLines($ownerPath)
-        if ($ownerLines.Count -ne 2 -or $ownerLines[1] -cne $expectedCommand) {
+        if ($ownerLines.Count -lt 2 -or $ownerLines.Count -gt 3 -or
+                $ownerLines[1] -cne $expectedCommand) {
             Fail "$product hook ownership command no longer matches its target"
         }
+        $flags = if ($ownerLines.Count -eq 3) { $ownerLines[2] } else { '' }
+        if ($flags -notin @('', 'created', 'config-created', 'cursor-version-created',
+                'config-created,cursor-version-created')) {
+            Fail "$product hook ownership state is invalid"
+        }
         $configPath = Get-FullSafeRoot $ownerLines[0] "$product owned hook configuration path"
-        Prepare-HookEdit 'remove' $product $configPath $ownerLines[1]
+        $configCreated = $flags -in @('created', 'config-created', 'config-created,cursor-version-created')
+        $cursorVersionCreated = $flags -in @('cursor-version-created', 'config-created,cursor-version-created')
+        $removeCursorVersion = $cursorVersionCreated -and
+            -not (Test-OtherHookOwner $product $configPath $ownerPath)
+        Prepare-HookEdit 'remove' $product $configPath $ownerLines[1] $removeCursorVersion
+        $stage = $script:HookStages[-1]
+        $stage.ConfigCreated = $configCreated
+        $stage.CursorVersionCreated = $cursorVersionCreated
     }
 }
 
@@ -530,7 +642,18 @@ function Rollback-HookChanges {
     $rollbackSucceeded = $true
     foreach ($stage in $script:HookStages) {
         if (-not $stage.Committed) { continue }
-        if ((Test-PathEntry $stage.ConfigPath) -and
+        if ($stage.Deleted -and -not (Test-PathEntry $stage.ConfigPath)) {
+            try {
+                $parent = [System.IO.Path]::GetDirectoryName($stage.ConfigPath)
+                $temporary = Join-Path $parent ('.team-skills-rollback.' + [guid]::NewGuid().ToString('N'))
+                [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.BeforePath))
+                Set-FileAccessSddl $temporary $stage.AccessControlSddl
+                Move-Item -Force -LiteralPath $temporary -Destination $stage.ConfigPath
+                Set-FileAccessSddl $stage.ConfigPath $stage.AccessControlSddl
+            }
+            catch { $rollbackSucceeded = $false }
+        }
+        elseif ((Test-PathEntry $stage.ConfigPath) -and
                 (Test-FileBytesEqual $stage.ConfigPath $stage.AfterPath)) {
             try {
                 if ($stage.Existed) {
@@ -572,6 +695,19 @@ function Commit-HookChanges {
         }
         $parent = [System.IO.Path]::GetDirectoryName($stage.ConfigPath)
         $null = New-Item -ItemType Directory -Force -Path $parent
+        if ($Action -ceq 'remove' -and $stage.ConfigCreated -and
+                (Test-RemovableCreatedHookConfig $stage.AfterPath $stage.Product)) {
+            try {
+                Remove-Item -Force -LiteralPath $stage.ConfigPath
+                $stage.Deleted = $true
+                $stage.Committed = $true
+                continue
+            }
+            catch {
+                $null = Rollback-HookChanges
+                Fail "cannot remove Team Skills-created $($stage.Product) hook configuration"
+            }
+        }
         $temporary = Join-Path $parent ('.team-skills-hooks.' + [guid]::NewGuid().ToString('N'))
         try {
             [System.IO.File]::WriteAllBytes($temporary, [System.IO.File]::ReadAllBytes($stage.AfterPath))
@@ -616,8 +752,16 @@ function Finalize-HookOwnership([bool]$Removing) {
     foreach ($product in @('claude', 'codex', 'cursor')) {
         $ownerPath = Join-Path $script:HookOwnershipRoot ($product + '.owner')
         $temporary = Join-Path $script:HookOwnershipRoot ('.' + $product + '.owner.' + [guid]::NewGuid().ToString('N'))
+        $stage = @($script:HookStages | Where-Object { $_.Product -ceq $product })[-1]
+        $flags = if ($stage.ConfigCreated -and $stage.CursorVersionCreated) {
+            'config-created,cursor-version-created'
+        }
+        elseif ($stage.ConfigCreated) { 'config-created' }
+        elseif ($stage.CursorVersionCreated) { 'cursor-version-created' }
+        else { '' }
         $text = (Get-HookConfigPath $product) + [Environment]::NewLine +
             $script:HookCommand + [Environment]::NewLine
+        if ($flags.Length -gt 0) { $text += $flags + [Environment]::NewLine }
         [System.IO.File]::WriteAllText($temporary, $text, [System.Text.UTF8Encoding]::new($false))
         Move-Item -Force -LiteralPath $temporary -Destination $ownerPath
     }
