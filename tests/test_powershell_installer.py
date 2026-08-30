@@ -227,7 +227,25 @@ class PowerShellInstallerTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.codex_hooks.write_text(
-            json.dumps({"foreign": True, "hooks": {"Other": [{"command": "foreign-codex"}]}}),
+            json.dumps(
+                {
+                    "description": "Keep this unrelated Codex configuration",
+                    "hooks": {
+                        "Other": [
+                            {
+                                "matcher": "startup",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "foreign-codex",
+                                        "async": True,
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         self.cursor_hooks.write_text(
@@ -252,6 +270,10 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertEqual(claude["hooks"]["SessionStart"][0]["matcher"], "startup|clear")
         self.assertEqual(claude["hooks"]["SessionStart"][0]["hooks"][0]["command"], commands["claude"])
         self.assertTrue(claude["hooks"]["SessionStart"][0]["hooks"][0]["async"])
+        self.assertEqual(codex["description"], "Keep this unrelated Codex configuration")
+        self.assertEqual(
+            codex["hooks"]["Other"][0]["hooks"][0]["command"], "foreign-codex"
+        )
         self.assertEqual(codex["hooks"]["SessionStart"][0]["matcher"], "startup|clear")
         self.assertEqual(codex["hooks"]["SessionStart"][0]["hooks"][0]["command"], commands["codex"])
         self.assertEqual(cursor["hooks"]["workspaceOpen"], [{"command": "keep-workspace"}])
@@ -280,7 +302,12 @@ class PowerShellInstallerTests(unittest.TestCase):
         expected_acls = {}
         for product, path in hook_paths.items():
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"foreign": product}) + "\n", encoding="utf-8")
+            baseline = (
+                {"description": "protected-codex"}
+                if product == "codex"
+                else {"foreign": product}
+            )
+            path.write_text(json.dumps(baseline) + "\n", encoding="utf-8")
             expected_acls[product] = self.protect_and_read_acl(path)
 
         installed = self.run_installer("install", origin)
@@ -296,7 +323,11 @@ class PowerShellInstallerTests(unittest.TestCase):
         removed = self.run_installer("remove", origin)
         self.assertEqual(removed.returncode, 0, removed.stderr)
         for product, path in hook_paths.items():
-            self.assertEqual(self.read_hook_config(product)["foreign"], product)
+            value = self.read_hook_config(product)
+            if product == "codex":
+                self.assertEqual(value["description"], "protected-codex")
+            else:
+                self.assertEqual(value["foreign"], product)
             self.assertEqual(self.read_acl(path), expected_acls[product])
 
     def test_two_catalog_hooks_coexist_and_one_removal_is_exact(self) -> None:
@@ -338,6 +369,27 @@ class PowerShellInstallerTests(unittest.TestCase):
         self.assertEqual(self.claude_hooks.read_bytes(), malformed)
         self.assertFalse(self.codex_hooks.exists())
         self.assertFalse(self.cursor_hooks.exists())
+
+    def test_product_invalid_codex_root_refuses_install_without_overwrite(self) -> None:
+        _, origin = self.make_catalog("invalid-codex-root", "# Hooks")
+        self.codex_hooks.parent.mkdir(parents=True)
+        invalid_values = (
+            b'{ "foreign": true, "hooks": {"Other": []} }\r\n',
+            b'{"description":7,"hooks":{}}\r\n',
+        )
+        for original in invalid_values:
+            with self.subTest(original=original):
+                self.codex_hooks.write_bytes(original)
+                expected_acl = self.protect_and_read_acl(self.codex_hooks)
+
+                refused = self.run_installer("install", origin)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("codex hook configuration is malformed, unsupported", refused.stderr)
+                self.assertEqual(self.codex_hooks.read_bytes(), original)
+                self.assertEqual(self.read_acl(self.codex_hooks), expected_acl)
+                self.assertFalse(self.claude_hooks.exists())
+                self.assertFalse(self.cursor_hooks.exists())
+                self.assertFalse((self.agents / "common-skill").exists())
 
     def test_ambiguous_or_resource_exhausting_hook_json_is_refused_without_overwrite(self) -> None:
         _, origin = self.make_catalog("adversarial-hooks", "# Hooks")

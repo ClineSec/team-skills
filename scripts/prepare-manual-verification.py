@@ -164,7 +164,23 @@ def seed_foreign_files(root: Path) -> dict[str, Path]:
             "permissions": {"allow": ["Read"]},
             "hooks": {"PreToolUse": [{"hooks": [{"command": "foreign-claude"}]}]},
         },
-        "codex": {"foreign": True, "hooks": {"Other": [{"command": "foreign-codex"}]}},
+        "codex": {
+            "description": "Keep this unrelated Codex configuration",
+            "hooks": {
+                "Other": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "foreign-codex",
+                                "async": True,
+                            }
+                        ],
+                    }
+                ]
+            },
+        },
         "cursor": {
             "version": 1,
             "hooks": {

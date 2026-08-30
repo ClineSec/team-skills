@@ -33,8 +33,9 @@ python scripts/prepare-manual-verification.py prepare $TeamSkillsManualRoot
 
 The helper refuses an existing root and never launches a product. It creates two local bare origins
 with the same catalog ID and skill name, installs the first twice, installs the second once blank
-and once as `second`, seeds foreign configuration, and records before/after JSON and the visible
-collision warning. Inspect `fixture.json`, `evidence/install-transcript.txt`, both skill roots, and
+and once as `second`, seeds product-valid unrelated configuration (including a Codex description
+and unrelated `Other` hook), and records before/after JSON and the visible collision warning.
+Inspect `fixture.json`, `evidence/install-transcript.txt`, both skill roots, and
 all three hook files before launching anything. `RESULTS.md` is copied from the
 [pending results template](manual-results-template.md) with the tested Team Skills SHA filled in.
 

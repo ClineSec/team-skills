@@ -146,7 +146,25 @@ class PosixInstallerTests(unittest.TestCase):
             encoding="utf-8",
         )
         codex_config.write_text(
-            json.dumps({"foreign": True, "hooks": {"Other": [{"command": "foreign-codex"}]}}),
+            json.dumps(
+                {
+                    "description": "Keep this unrelated Codex configuration",
+                    "hooks": {
+                        "Other": [
+                            {
+                                "matcher": "startup",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "foreign-codex",
+                                        "async": True,
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         cursor_config.write_text(
@@ -173,7 +191,10 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertEqual(claude["hooks"]["SessionStart"][0]["matcher"], "startup|clear")
         self.assertEqual(claude["hooks"]["SessionStart"][0]["hooks"][0]["command"], commands["claude"])
         self.assertTrue(claude["hooks"]["SessionStart"][0]["hooks"][0]["async"])
-        self.assertTrue(codex["foreign"])
+        self.assertEqual(codex["description"], "Keep this unrelated Codex configuration")
+        self.assertEqual(
+            codex["hooks"]["Other"][0]["hooks"][0]["command"], "foreign-codex"
+        )
         self.assertEqual(codex["hooks"]["SessionStart"][0]["matcher"], "startup|clear")
         self.assertEqual(codex["hooks"]["SessionStart"][0]["hooks"][0]["command"], commands["codex"])
         self.assertEqual(cursor["hooks"]["workspaceOpen"], [{"command": "keep-workspace"}])
@@ -200,7 +221,12 @@ class PosixInstallerTests(unittest.TestCase):
         }
         for product, path in hook_paths.items():
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"foreign": product}) + "\n", encoding="utf-8")
+            baseline = (
+                {"description": "private-codex"}
+                if product == "codex"
+                else {"foreign": product}
+            )
+            path.write_text(json.dumps(baseline) + "\n", encoding="utf-8")
             path.chmod(0o600)
 
         installed = self.run_installer("install", origin)
@@ -245,7 +271,11 @@ class PosixInstallerTests(unittest.TestCase):
         removed = self.run_installer("remove", origin)
         self.assertEqual(removed.returncode, 0, removed.stderr)
         for product, path in hook_paths.items():
-            self.assertEqual(self.read_hook_config(product)["foreign"], product)
+            value = self.read_hook_config(product)
+            if product == "codex":
+                self.assertEqual(value["description"], "private-codex")
+            else:
+                self.assertEqual(value["foreign"], product)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_new_hook_configs_use_private_mode(self) -> None:
@@ -331,6 +361,32 @@ class PosixInstallerTests(unittest.TestCase):
         self.assertFalse((self.agents / "common-skill").exists())
         self.assertFalse((self.home / ".codex" / "hooks.json").exists())
         self.assertFalse((self.home / ".cursor" / "hooks.json").exists())
+
+    def test_product_invalid_codex_root_refuses_install_without_overwrite(self) -> None:
+        _, origin = self.make_catalog("invalid-codex-root", "# Hooks")
+        claude_config = self.home / ".claude" / "settings.json"
+        codex_config = self.home / ".codex" / "hooks.json"
+        claude_config.parent.mkdir(parents=True)
+        codex_config.parent.mkdir(parents=True)
+        claude_before = b'{"permissions":{"allow":["Read"]}}\n'
+        claude_config.write_bytes(claude_before)
+        invalid_values = (
+            b'{ "foreign": true, "hooks": {"Other": []} }\n',
+            b'{"description":7,"hooks":{}}\n',
+        )
+        for codex_before in invalid_values:
+            with self.subTest(codex_before=codex_before):
+                codex_config.write_bytes(codex_before)
+                codex_config.chmod(0o640)
+
+                refused = self.run_installer("install", origin)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("codex hook configuration is malformed, unsupported", refused.stderr)
+                self.assertEqual(claude_config.read_bytes(), claude_before)
+                self.assertEqual(codex_config.read_bytes(), codex_before)
+                self.assertEqual(stat.S_IMODE(codex_config.stat().st_mode), 0o640)
+                self.assertFalse((self.agents / "common-skill").exists())
+                self.assertFalse((self.home / ".cursor" / "hooks.json").exists())
 
     def test_hook_command_quotes_metacharacter_and_unicode_state_path(self) -> None:
         self.state = self.base / "state 🧪 with '$dollar"

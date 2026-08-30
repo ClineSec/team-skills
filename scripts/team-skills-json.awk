@@ -388,6 +388,23 @@ function validate_manifest(root,    index_value, name, id_node, display_node, pr
     print decode_string(node_value[prefix_node])
 }
 
+function validate_codex_root(root,    index_value, name, description, hooks) {
+    for (index_value = 1; index_value <= node_size[root]; index_value++) {
+        name = node_name[root SUBSEP index_value]
+        if (name != "description" && name != "hooks") {
+            fail("unsupported Codex hook root field")
+        }
+    }
+    description = object_value(root, "description")
+    if (description && node_kind[description] != "string") {
+        fail("Codex hook description must be a string")
+    }
+    hooks = object_value(root, "hooks")
+    if (hooks && node_kind[hooks] != "object") {
+        fail("Codex hooks must be a JSON object")
+    }
+}
+
 function owned_handler(id,    type_id, command_id, async_id) {
     if (node_kind[id] != "object" || node_size[id] != 3) return 0
     type_id = object_value(id, "type")
@@ -544,6 +561,7 @@ END {
     }
     if (operation != "add" && operation != "remove") fail("unsupported operation")
     if (product != "claude" && product != "codex" && product != "cursor") fail("unsupported product")
+    if (product == "codex") validate_codex_root(root_node)
     if (command == "") command = ENVIRON["TEAM_SKILLS_JSON_COMMAND"]
     if (command == "") fail("command must not be blank")
 

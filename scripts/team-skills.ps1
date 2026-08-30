@@ -273,6 +273,22 @@ function Test-OwnedCursorHook([object]$Value, [string]$Command) {
     return $commandProperty.Value -is [string] -and $commandProperty.Value -ceq $Command
 }
 
+function Test-CodexHookRoot([object]$Root) {
+    foreach ($property in $Root.PSObject.Properties) {
+        if ($property.Name -cne 'description' -and $property.Name -cne 'hooks') {
+            return $false
+        }
+    }
+    $description = Get-ExactJsonProperty $Root 'description'
+    if ($null -ne $description -and $description.Value -isnot [string]) { return $false }
+    $hooks = Get-ExactJsonProperty $Root 'hooks'
+    if ($null -ne $hooks -and
+            $hooks.Value -isnot [System.Management.Automation.PSCustomObject]) {
+        return $false
+    }
+    return $true
+}
+
 function Edit-HookJson([string]$Text, [string]$Operation, [string]$Product, [string]$Command) {
     if (-not (Test-SafeJsonText $Text)) {
         Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
@@ -284,6 +300,9 @@ function Edit-HookJson([string]$Text, [string]$Operation, [string]$Product, [str
         Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
     }
     if ($root -isnot [System.Management.Automation.PSCustomObject]) {
+        Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
+    }
+    if ($Product -ceq 'codex' -and -not (Test-CodexHookRoot $root)) {
         Fail "$Product hook configuration is malformed, unsupported, or no longer owned"
     }
 

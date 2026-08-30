@@ -129,9 +129,29 @@ class PosixJsonEditorTests(unittest.TestCase):
         self.assertEqual(json.loads(second.stdout), value)
 
     def test_codex_uses_startup_and_clear_async_group(self) -> None:
-        result = self.edit("{}", "add", "codex", "owned-codex-command")
+        unrelated = {
+            "description": "Keep this Codex hook description",
+            "hooks": {
+                "Other": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "foreign-codex",
+                                "async": True,
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+        result = self.edit(json.dumps(unrelated), "add", "codex", "owned-codex-command")
         self.assertEqual(result.returncode, 0, result.stderr)
-        groups = json.loads(result.stdout)["hooks"]["SessionStart"]
+        value = json.loads(result.stdout)
+        self.assertEqual(value["description"], unrelated["description"])
+        self.assertEqual(value["hooks"]["Other"], unrelated["hooks"]["Other"])
+        groups = value["hooks"]["SessionStart"]
         self.assertEqual(
             groups,
             [
@@ -143,6 +163,21 @@ class PosixJsonEditorTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_codex_rejects_unknown_root_fields_and_invalid_description_without_output(self) -> None:
+        for source in ('{"foreign":true}', '{"description":7,"hooks":{}}'):
+            with self.subTest(source=source):
+                result = self.edit(source, "add", "codex", "owned")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+        # These are product-specific restrictions; other editors continue preserving
+        # unrelated root fields.
+        for product in ("claude", "cursor"):
+            with self.subTest(product=product):
+                result = self.edit('{"foreign":true}', "add", product, "owned")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(json.loads(result.stdout)["foreign"])
 
     def test_cursor_adds_session_start_only_and_preserves_other_events(self) -> None:
         source = json.dumps(
@@ -168,7 +203,7 @@ class PosixJsonEditorTests(unittest.TestCase):
     def test_remove_deletes_only_exact_owned_entry(self) -> None:
         for product in ("claude", "codex", "cursor"):
             with self.subTest(product=product):
-                source = '{"foreign":true}'
+                source = '{"description":"keep"}' if product == "codex" else '{"foreign":true}'
                 owned_command = f"owned-{product}"
                 added = self.edit(source, "add", product, owned_command)
                 self.assertEqual(added.returncode, 0, added.stderr)
@@ -179,7 +214,10 @@ class PosixJsonEditorTests(unittest.TestCase):
                 removed = self.edit(with_foreign.stdout, "remove", product, owned_command)
                 self.assertEqual(removed.returncode, 0, removed.stderr)
                 value = json.loads(removed.stdout)
-                self.assertTrue(value["foreign"])
+                if product == "codex":
+                    self.assertEqual(value["description"], "keep")
+                else:
+                    self.assertTrue(value["foreign"])
                 serialized = json.dumps(value)
                 self.assertNotIn(owned_command, serialized)
                 self.assertIn(foreign_command, serialized)

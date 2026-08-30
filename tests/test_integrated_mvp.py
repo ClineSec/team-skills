@@ -164,8 +164,21 @@ class IntegratedMvpProof(unittest.TestCase):
                 "hooks": {"PreToolUse": [{"hooks": [{"command": "foreign-claude"}]}]},
             },
             "codex": {
-                "foreign": True,
-                "hooks": {"Other": [{"command": "foreign-codex"}]},
+                "description": "Keep this unrelated Codex configuration",
+                "hooks": {
+                    "Other": [
+                        {
+                            "matcher": "startup",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "foreign-codex",
+                                    "async": True,
+                                }
+                            ],
+                        }
+                    ]
+                },
             },
             "cursor": {
                 "version": 1,
@@ -185,7 +198,7 @@ class IntegratedMvpProof(unittest.TestCase):
         cursor = self.read_json(self.hook_files["cursor"])
         self.assertEqual(claude["permissions"], {"allow": ["Read"]})
         self.assertIn("foreign-claude", self.command_values(claude))
-        self.assertTrue(codex["foreign"])
+        self.assertEqual(codex["description"], "Keep this unrelated Codex configuration")
         self.assertIn("foreign-codex", self.command_values(codex))
         self.assertEqual(cursor["hooks"]["workspaceOpen"], [{"command": "foreign-workspace"}])
         self.assertIn("foreign-cursor", self.command_values(cursor))
