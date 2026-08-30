@@ -86,6 +86,27 @@ CLAUDE_HOOKS_FILE=${TEAM_SKILLS_CLAUDE_HOOKS_FILE:-$HOME/.claude/settings.json}
 CODEX_HOOKS_FILE=${TEAM_SKILLS_CODEX_HOOKS_FILE:-${CODEX_HOME:-$HOME/.codex}/hooks.json}
 CURSOR_HOOKS_FILE=${TEAM_SKILLS_CURSOR_HOOKS_FILE:-$HOME/.cursor/hooks.json}
 
+# A user may intentionally make the portable Agent Skills roots converge on one physical
+# directory. Resolve only the final, already-existing skill-root link once so every later
+# ownership check and mutation operates on the stable physical directory. Other managed roots
+# and hook files retain the stricter no-link rule below.
+resolve_existing_skill_root_link() {
+    skill_root=$1
+    skill_root_label=$2
+    if [ -L "$skill_root" ]; then
+        [ -d "$skill_root" ] || die "$skill_root_label symlink must resolve to a directory"
+        resolved_skill_root=$(CDPATH= cd -P "$skill_root" 2>/dev/null && pwd -P) || \
+            die "$skill_root_label symlink cannot be resolved"
+        [ -n "$resolved_skill_root" ] || die "$skill_root_label symlink cannot be resolved"
+        printf '%s\n' "$resolved_skill_root"
+    else
+        printf '%s\n' "$skill_root"
+    fi
+}
+
+AGENTS_ROOT=$(resolve_existing_skill_root_link "$AGENTS_ROOT" TEAM_SKILLS_AGENTS_ROOT) || exit 1
+CLAUDE_ROOT=$(resolve_existing_skill_root_link "$CLAUDE_ROOT" TEAM_SKILLS_CLAUDE_ROOT) || exit 1
+
 reject_unsafe_root() {
     root_value=$1
     root_label=$2
@@ -1175,7 +1196,18 @@ for product in agents claude; do
         # symlink(2) is an atomic no-clobber operation at the final destination. A temporary link
         # followed by mv could overwrite a file that appeared after the collision preflight.
         if ! ln -s "$expected_target" "$destination"; then
-            die "cannot expose skill $effective_name"
+            # When both product roots resolve to the same directory, the agents pass created the
+            # one physical exposure moments earlier. Accept it for Claude only when the complete
+            # ownership proof matches this transaction; all other no-clobber failures still stop.
+            shared_owner=$INSTALL_ROOT/ownership/agents/$effective_name.owner
+            if [ "$product" = claude ] && [ "$AGENTS_ROOT" = "$CLAUDE_ROOT" ] && \
+                    [ -f "$shared_owner" ] && [ ! -L "$shared_owner" ] && \
+                    [ -L "$destination" ] && [ "$(readlink "$destination")" = "$expected_target" ] && \
+                    printf '%s\n' "$expected_target" | cmp -s - "$shared_owner"; then
+                :
+            else
+                die "cannot expose skill $effective_name"
+            fi
         fi
         printf '%s\n' "$expected_target" >"$owner_file" || die "cannot record ownership for skill $effective_name"
     done

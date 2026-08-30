@@ -787,6 +787,30 @@ class PosixInstallerTests(unittest.TestCase):
             (self.agents / "common-skill" / "SKILL.md").read_text(),
         )
 
+    def test_linked_product_roots_can_share_one_portable_skill_store(self) -> None:
+        _, origin = self.make_catalog("shared-root", "# Shared root")
+        shared = self.home / ".codex" / "skills"
+        shared.mkdir(parents=True)
+        self.agents.parent.mkdir(parents=True)
+        self.claude.parent.mkdir(parents=True)
+        self.agents.symlink_to(shared, target_is_directory=True)
+        self.claude.symlink_to(shared, target_is_directory=True)
+
+        installed = self.run_installer("install", origin)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        exposure = shared / "common-skill"
+        self.assertTrue(exposure.is_symlink())
+        self.assertIn("# Shared root", (exposure / "SKILL.md").read_text())
+
+        install_root = self.instance_root() / "installs" / "_default"
+        self.assertTrue((install_root / "ownership" / "agents" / "common-skill.owner").is_file())
+        self.assertTrue((install_root / "ownership" / "claude" / "common-skill.owner").is_file())
+
+        removed = self.run_installer("remove", origin)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(exposure.exists())
+        self.assertFalse(exposure.is_symlink())
+
     def test_invalid_root_fails_before_clone_or_mutation(self) -> None:
         self.env["TEAM_SKILLS_STATE_ROOT"] = "relative/state"
         result = self.run_installer("install", "/not/used")
