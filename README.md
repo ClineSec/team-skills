@@ -48,6 +48,26 @@ administrator or Developer Mode access. Hook registration preserves unrelated JS
 handlers, and catalog entries. An existing malformed or unsupported hook file makes installation
 fail without overwriting that file or exposing a partial installation.
 
+## Managed macOS deployment
+
+Team Skills can be deployed through a macOS mobile device management (MDM) product without
+changing its user-global ownership model. The MDM command must identify the logged-in console
+user and run the installer in that user's launch context; running the installer directly as the
+MDM agent would incorrectly install it for `root`.
+
+Setup guides and a checksum-pinned deployment script are provided for:
+
+- [Iru](docs/mdm/iru.md) (formerly Kandji);
+- [Jamf Pro](docs/mdm/jamf-pro.md);
+- [Mosyle](docs/mdm/mosyle.md).
+
+Create one MDM item per catalog. Substitute that fork's reviewed installer URL, SHA-256 digest,
+repository URL, and optional skill-name prefix. Private catalogs also need noninteractive Git
+authentication in the target user's context; never embed a token or password in a URL, script,
+parameter, or MDM log. MDM performs the initial user-scoped installation, while the normal Team
+Skills session-start hooks continue to provide one-shot updates without a service or scheduled
+job.
+
 ## Automatic updates at session start
 
 Each installed catalog has its own hook entry, lock, throttle, and managed clone. The hook command
