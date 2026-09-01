@@ -48,7 +48,7 @@ must remain a fast-forward from the managed revision.
 Repository URLs are allowed only at initial bootstrap boundaries and in explanatory documentation.
 Every fetch, pull, status check, or recovery operation after cloning must derive its remote from
 the clone's currently configured and instance-bound `origin`. Operational code must not contain an
-AppSecThings, GitHub, or other fallback upstream.
+embedded repository owner, hosting service, or other fallback source.
 
 The state-root layout and digest encoding are documented in `docs/operations.md`. They must remain
 deterministic, credential-safe, collision-resistant, and work on macOS, Linux, native Windows, and

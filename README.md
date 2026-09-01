@@ -5,6 +5,10 @@ Code, Codex, and Cursor. A team forks the repository, curates `skills/`, and tre
 clone's configured Git `origin` as the authority for later reconciliations. No operational path
 falls back to this repository's upstream.
 
+The original Team Skills project is maintained at
+[github.com/ClineSec/team-skills](https://github.com/ClineSec/team-skills). Forks remain independent:
+installation and updates use each fork's configured `origin`, not the original project's URL.
+
 ## Install a fork
 
 Fork owners must change **both** `YOUR-ORG` occurrences below to their fork owner. The repository
@@ -241,3 +245,10 @@ See [the catalog contract](docs/catalog-contract.md) for exact multi-catalog sem
 [manual verification](docs/manual-verification.md) for the repeatable disposable fixture, pending
 results template, and WSL/product checks that still require a human. The bounded Milestone 5
 [security review](docs/security-review.md) records trust boundaries and residual risks.
+
+## License and copyright
+
+Original material created by Cline Technologies and published in this repository is licensed under
+the [Apache License 2.0](LICENSE). This does not claim ownership of skills or other original material
+created by others, including material added in forks. See [COPYRIGHT](COPYRIGHT) for the ownership
+boundary.
